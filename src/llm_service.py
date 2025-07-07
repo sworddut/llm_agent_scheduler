@@ -33,7 +33,7 @@ class LLMService:
             raise ValueError("OpenAI API key is required. Please set OPENAI_API_KEY in .env file.")
             
         self.model = model
-        self.client = AsyncOpenAI(api_key="YOUR_API_KEY_FROM_CLOUD_SILICONFLOW_CN", 
+        self.client = AsyncOpenAI(api_key=self.api_key, 
                 base_url="https://api.siliconflow.cn/v1")
     
     async def generate_text(

@@ -1,7 +1,7 @@
 # src/task.py
 from enum import Enum
 from uuid import uuid4
-from typing import Optional, Dict, Any, List
+from typing import Union, Optional, Dict, Any, List
 import time
 from datetime import datetime
 

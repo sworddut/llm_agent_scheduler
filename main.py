@@ -112,11 +112,12 @@ async def submit_task(input: TaskInput):
         # 将任务添加到调度器
         await scheduler.add_task(task)
         
-        logger.info(f"任务已提交: {task.task_id} - {task.name} (类型: {task_type}, 优先级: {task.priority})")
+        logger.info(f"任务已提交: {task.id} - {task.name} (类型: {task_type}, 优先级: {task.priority})")
         
-        return {"task_id": task.task_id, "status": "queued", "message": "任务已加入队列"}
+        return {"task_id": task.id, "status": "queued", "message": "任务已加入队列"}
         
     except Exception as e:
+        print(e)
         logger.error(f"提交任务失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 

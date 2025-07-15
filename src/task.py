@@ -8,64 +8,56 @@ from datetime import datetime
 class TaskStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_FOR_TOOL = "waiting_for_tool"
+    WAITING_FOR_SUBTASKS = "waiting_for_subtasks"  # 新增状态：等待工具调用完成
     COMPLETED = "completed"
     FAILED = "failed"
     PREEMPTED = "preempted"  # 新增：被抢占状态
 
 class TaskType(str, Enum):
     """任务类型枚举"""
-    FUNCTION_CALL = "function_call"  # 函数调用
-    API_REQUEST = "api_request"      # API请求
-    FILE_OPERATION = "file_operation"  # 文件操作
-    CUSTOM = "custom"                # 自定义任务
+    FUNCTION_CALL = "function_call"  # 一个直接的工具或函数调用
+    REASONING = "reasoning"          # 需要LLM进行推理
+    PLANNING = "planning"            # 一个需要被分解的复杂任务
 
 class Task:
     def __init__(self, name: str, payload: dict, priority: int = 1, 
                  task_type: Union[TaskType, str] = TaskType.FUNCTION_CALL,
                  estimated_time: float = 1.0,
-                 tags: Optional[List[str]] = None):
+                 tags: Optional[List[str]] = None,
+                 parent_id: Optional[str] = None,
+                 dependencies: Optional[List[str]] = None,
+                 is_decomposable: bool = False):
+
         self.id = str(uuid4())
         self.name = name
         self.payload = payload
-        self.priority = priority  # 0: high, 1: normal, 2: low
+        self.priority = priority
+        self.task_type = task_type if isinstance(task_type, TaskType) else TaskType(task_type)
+        self.estimated_time = estimated_time
+        self.tags = tags if tags is not None else []
+
+        # --- Dependency and hierarchy fields ---
+        self.parent_id = parent_id
+        self.dependencies = dependencies if dependencies is not None else []
+        self.is_decomposable = is_decomposable
+        self.subtasks: List[str] = []  # Populated by the scheduler for parent tasks
+
+        # --- State and Result ---
         self.status = TaskStatus.QUEUED
         self.result: Optional[Any] = None
         self.error: Optional[str] = None
-        
-        # 任务类型处理
-        if isinstance(task_type, str):
-            # 尝试将字符串转换为 TaskType 枚举
-            try:
-                self.task_type = TaskType(task_type.lower())
-            except ValueError:
-                # 如果不是预定义的类型，使用 CUSTOM 类型，并保存原始字符串
-                self.task_type = TaskType.CUSTOM
-                self.metadata = {"custom_task_type": task_type}
-        else:
-            self.task_type = task_type
-            
-        # 标签
-        self.tags = tags or []
-        
-        # 时间跟踪
+
+        # --- Time Tracking ---
         self.created_at = datetime.now()
         self.started_at: Optional[datetime] = None
         self.completed_at: Optional[datetime] = None
-        self.wait_time: Optional[float] = None  # 等待时间（秒）
-        self.execution_time: Optional[float] = None  # 执行时间（秒）
-        
-        # 调度相关
-        self.estimated_time = estimated_time  # 预估执行时间（秒）
-        self.time_slice: Optional[float] = None  # 分配的时间片（秒）
-        self.preempted = False  # 是否被抢占
-        
-        # 依赖和子任务
-        self.dependencies: List[str] = []  # 依赖任务ID列表
-        self.subtasks: List[str] = []  # 子任务ID列表
-        
-        # 元数据
-        self.metadata: Dict[str, Any] = {}  # 存储任务相关的元数据
-        self.tags: List[str] = []  # 任务标签
+        self.wait_time: Optional[float] = None
+        self.execution_time: Optional[float] = None
+
+        # --- Scheduler Internals ---
+        self.preempted = False
+        self.metadata: Dict[str, Any] = {}
 
     def start(self):
         """开始执行任务"""
@@ -118,29 +110,28 @@ class Task:
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典表示"""
-        # 处理任务类型，如果是自定义类型，返回原始字符串
-        task_type = self.task_type
-        if hasattr(self, 'metadata') and 'custom_task_type' in self.metadata:
-            task_type = self.metadata['custom_task_type']
-            
         return {
             "id": self.id,
             "name": self.name,
             "priority": self.priority,
-            "status": self.status.value if hasattr(self.status, 'value') else self.status,
-            "task_type": task_type.value if hasattr(task_type, 'value') else task_type,
+            "status": self.status.value,
+            "task_type": self.task_type.value,
+            "is_decomposable": self.is_decomposable,
+
+            "parent_id": self.parent_id,
+            "dependencies": self.dependencies,
+            "subtasks": self.subtasks,
+
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "wait_time": self.wait_time,
             "execution_time": self.execution_time,
-            "estimated_time": self.estimated_time,
+
             "result": self.result,
             "error": self.error,
             "tags": self.tags,
-            "dependencies": self.dependencies,
-            "subtasks": self.subtasks,
-            "metadata": getattr(self, 'metadata', {})
+            "metadata": self.metadata
         }
 
     def __repr__(self):

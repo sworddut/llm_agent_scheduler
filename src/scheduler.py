@@ -1,173 +1,257 @@
-# src/scheduler.py
 import asyncio
-from collections import deque, defaultdict
-from typing import Optional, List, Dict
-from enum import Enum
-from .task import Task, TaskStatus
+import logging
+from typing import Dict, Any, Optional, AsyncGenerator, List
 
-class SchedulingStrategy(str, Enum):
-    """调度策略枚举"""
-    PRIORITY_BASED = "priority_based"  # 基于优先级的调度
-    ROUND_ROBIN = "round_robin"        # 时间片轮转
-    PREEMPTIVE = "preemptive"          # 抢占式调度
-    SHORTEST_JOB_FIRST = "shortest_job_first"  # 最短作业优先
+from .task import Task, TaskStatus, TaskType
+from .agent import Agent, PlannerAgent
+from .llm_service import LLMService
+
+logger = logging.getLogger(__name__)
 
 class Scheduler:
-    def __init__(self, levels=3, strategy=SchedulingStrategy.PRIORITY_BASED, time_slice=1.0):
-        """
-        初始化调度器
+    """
+    An OS-like scheduler that manages the lifecycle of LLM agent tasks.
+    It drives tasks, handles I/O (tool calls) by pausing and resuming tasks,
+    and enables true concurrent execution.
+    """
+
+    def __init__(self, llm_service: LLMService, max_concurrent_tasks: int = 5):
+        self.llm_service = llm_service
+        self.agent = Agent(llm_service)
+        self.planner_agent = PlannerAgent(llm_service)
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
         
-        Args:
-            levels: 优先级队列数量
-            strategy: 调度策略
-            time_slice: 时间片大小(秒)
-        """
-        self.queues = defaultdict(deque)  # 多级队列：priority -> deque
-        self.lock = asyncio.Lock()
-        self.levels = levels
-        self.strategy = strategy
-        self.time_slice = time_slice
-        self.current_task: Optional[Task] = None
-        self.task_history: List[Task] = []
-        self.running_tasks: Dict[str, Task] = {}  # 正在运行的任务 id -> task
-        self.task_stats = {
-            "total": 0,
-            "completed": 0,
-            "failed": 0,
-            "avg_wait_time": 0,
-            "avg_execution_time": 0
-        }
-    
+        self.pending_queue = asyncio.Queue()
+        self.resumption_queue = asyncio.Queue()
+        
+        self.tasks: Dict[str, Task] = {}
+        self.task_generators: Dict[str, AsyncGenerator] = {}
+        
+        self.is_running = False
+        self._main_loop_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+        # Statistics
+        self.completed_tasks_count = 0
+        self.failed_tasks_count = 0
+        self.running_tasks_count = 0
+        self.pending_tasks_count = 0
+        self.waiting_tasks_count = 0
+
+    async def start(self):
+        """Starts the scheduler's main loop in the background."""
+        if self.is_running:
+            logger.warning("Scheduler is already running.")
+            return
+        self.is_running = True
+        self._main_loop_task = asyncio.create_task(self._main_loop())
+        logger.info("Scheduler started.")
+
+    async def stop(self):
+        """Stops the scheduler's main loop gracefully."""
+        self.is_running = False
+        if self._main_loop_task:
+            self._main_loop_task.cancel()
+            try:
+                await self._main_loop_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Scheduler stopped.")
+
     async def add_task(self, task: Task):
-        """添加任务到队列"""
-        async with self.lock:
-            self.queues[task.priority].append(task)
-            self.task_stats["total"] += 1
-            # 如果是抢占式调度且新任务优先级高于当前任务，可以抢占
-            if (self.strategy == SchedulingStrategy.PREEMPTIVE and 
-                self.current_task and 
-                task.priority < self.current_task.priority):
-                # 标记当前任务需要被抢占
-                self.current_task.preempted = True
-    
-    async def get_next_task(self) -> Optional[Task]:
-        """根据调度策略获取下一个任务"""
-        async with self.lock:
-            if self.strategy == SchedulingStrategy.PRIORITY_BASED:
-                return await self._get_priority_based_task()
-            elif self.strategy == SchedulingStrategy.ROUND_ROBIN:
-                return await self._get_round_robin_task()
-            elif self.strategy == SchedulingStrategy.SHORTEST_JOB_FIRST:
-                return await self._get_shortest_job_task()
+        """Adds a new task to the scheduler's queue."""
+        async with self._lock:
+            self.tasks[task.id] = task
+            self.pending_tasks_count += 1
+        await self.pending_queue.put(task)
+        logger.info(f"Task {task.id} added to the queue.")
+
+    async def _main_loop(self):
+        """The core loop that sources tasks from pending and resumption queues."""
+        logger.info("Scheduler main loop started.")
+        while self.is_running:
+            pending_task_future = asyncio.create_task(self.pending_queue.get())
+            resumption_task_future = asyncio.create_task(self.resumption_queue.get())
+
+            try:
+                done, pending = await asyncio.wait(
+                    [pending_task_future, resumption_task_future],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for future in pending:
+                    future.cancel()
+
+                task = done.pop().result()
+                await self.semaphore.acquire()
+                asyncio.create_task(self._drive_task(task))
+
+            except asyncio.CancelledError:
+                logger.info("Main loop cancelled.")
+                pending_task_future.cancel()
+                resumption_task_future.cancel()
+                break
+            except Exception as e:
+                logger.error(f"An error occurred in the main loop: {e}", exc_info=True)
+
+        logger.info("Scheduler main loop stopped.")
+
+    async def _drive_task(self, task: Task, tool_result: Any = None):
+        # This wrapper ensures the semaphore is acquired and released correctly.
+        await self.semaphore.acquire()
+        try:
+
+            # --- Task Decomposition Step ---
+            if task.task_type == TaskType.PLANNING and task.status == TaskStatus.QUEUED:
+                try:
+
+                    plan = await self.planner_agent.decompose_task(task)
+                    subtask_defs = plan.get('subtasks', []) if plan else []
+
+                    if not subtask_defs:
+                        # If planner returns nothing, mark parent as completed.
+                        await self._handle_task_completion(task)
+                        return
+
+                    subtask_map = {}
+                    for sub_def in subtask_defs:
+
+                        subtask = Task(
+                            name=sub_def['name'],
+                            payload=sub_def['payload'],
+                            task_type=TaskType(sub_def['task_type'].lower()),
+                            parent_id=task.id,
+                            dependencies=[subtask_map[dep_name].id for dep_name in sub_def.get('dependencies', [])]
+                        )
+                        self.tasks[subtask.id] = subtask
+                        task.subtasks.append(subtask.id)
+                        subtask_map[sub_def['name']] = subtask
+
+
+                    # Enqueue subtasks with no dependencies
+                    for subtask in subtask_map.values():
+                        if not subtask.dependencies:
+                            await self.pending_queue.put(subtask)
+                            logger.info(f"Enqueued subtask '{subtask.name}' for parent {task.id}")
+
+                    task.status = TaskStatus.WAITING_FOR_SUBTASKS
+                    logger.info(f"Parent task {task.id} is now WAITING_FOR_SUBTASKS.")
+
+                except Exception as e:
+                    logger.error(f"Failed to decompose task {task.id}: {e}", exc_info=True)
+                    task.fail(f"Decomposition failed: {e}")
+                    await self._handle_task_completion(task)
+                return
+
+            # --- Standard Task Driving Step ---
+            if task.id not in self.task_generators:
+                if task.status == TaskStatus.QUEUED:
+                    task.start()
+                    self.task_generators[task.id] = self.agent.process_task(task)
+                    send_value = None
+                else:
+                    logger.warning(f"Task {task.id} (status: {task.status}) has no generator. Re-creating.")
+                    self.task_generators[task.id] = self.agent.process_task(task)
+                    send_value = tool_result
             else:
-                # 默认使用优先级调度
-                return await self._get_priority_based_task()
-    
-    async def _get_priority_based_task(self) -> Optional[Task]:
-        """基于优先级的调度策略"""
-        for level in range(self.levels):
-            if self.queues[level]:
-                task = self.queues[level].popleft()
-                self.current_task = task
-                self.running_tasks[task.id] = task
-                return task
-        return None
-    
-    async def _get_round_robin_task(self) -> Optional[Task]:
-        """时间片轮转调度策略"""
-        # 从最高优先级开始，每个队列取一个任务
-        for level in range(self.levels):
-            if self.queues[level]:
-                task = self.queues[level].popleft()
-                # 设置时间片
-                task.time_slice = self.time_slice
-                self.current_task = task
-                self.running_tasks[task.id] = task
-                return task
-        return None
-    
-    async def _get_shortest_job_task(self) -> Optional[Task]:
-        """最短作业优先调度策略"""
-        shortest_task = None
-        shortest_time = float('inf')
-        shortest_queue = None
-        shortest_index = None
-        
-        # 查找所有队列中预估执行时间最短的任务
-        for level in range(self.levels):
-            for i, task in enumerate(self.queues[level]):
-                if task.estimated_time < shortest_time:
-                    shortest_time = task.estimated_time
-                    shortest_task = task
-                    shortest_queue = level
-                    shortest_index = i
-        
-        # 如果找到了最短任务，从队列中移除并返回
-        if shortest_task:
-            self.queues[shortest_queue].remove(shortest_task)
-            self.current_task = shortest_task
-            self.running_tasks[shortest_task.id] = shortest_task
-            return shortest_task
-        
-        return None
-    
-    async def task_completed(self, task: Task):
-        """任务完成后的处理"""
-        async with self.lock:
-            if task.id in self.running_tasks:
-                del self.running_tasks[task.id]
-            
-            # 更新任务历史和统计信息
-            self.task_history.append(task)
-            if task.status == TaskStatus.COMPLETED:
-                self.task_stats["completed"] += 1
-            elif task.status == TaskStatus.FAILED:
-                self.task_stats["failed"] += 1
-            
-            # 计算平均等待和执行时间
-            if task.wait_time:
-                self.task_stats["avg_wait_time"] = (
-                    (self.task_stats["avg_wait_time"] * (self.task_stats["completed"] + self.task_stats["failed"] - 1) + task.wait_time) / 
-                    (self.task_stats["completed"] + self.task_stats["failed"])
-                )
-            
-            if task.execution_time:
-                self.task_stats["avg_execution_time"] = (
-                    (self.task_stats["avg_execution_time"] * (self.task_stats["completed"] + self.task_stats["failed"] - 1) + task.execution_time) / 
-                    (self.task_stats["completed"] + self.task_stats["failed"])
+                task.status = TaskStatus.RUNNING
+                send_value = tool_result
+
+            generator = self.task_generators[task.id]
+            try:
+                tool_request = await generator.asend(send_value)
+                if tool_request and tool_request.get("type") == "tool_call":
+                    task.status = TaskStatus.WAITING_FOR_TOOL
+                    logger.info(f"Task {task.id} ({task.name}) is waiting for tool call.")
+                    asyncio.create_task(self._execute_and_resume_task(task, tool_request))
+
+            except StopAsyncIteration:
+                logger.info(f"Task {task.id} ({task.name}) execution generator finished.")
+                await self._handle_task_completion(task)
+
+            except Exception as e:
+                logger.error(f"Generator for task {task.id} ({task.name}) failed: {e}", exc_info=True)
+                task.fail(str(e))
+                await self._handle_task_completion(task)
+
+        except Exception as e:
+            logger.error(f"Critical error in _drive_task for {task.id} ({task.name}): {e}", exc_info=True)
+            task.fail(f"Scheduler-level error: {e}")
+            await self._handle_task_completion(task)
+        finally:
+            self.semaphore.release()
+
+    async def _execute_and_resume_task(self, task: Task, tool_calls: list):
+        """Executes tool calls and places the task in the resumption queue."""
+        logger.info(f"Executing {len(tool_calls)} tool calls for task {task.id}...")
+        await asyncio.sleep(2)  # Simulate I/O
+        import json
+        tool_results = []
+        for tool_call in tool_calls.get("tool_calls", []):
+            # In a real scenario, you'd execute the tool and get a real result.
+            tool_results.append({
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": tool_call.function.name,
+                "content": json.dumps({"temperature": "30", "unit": "celsius"})  # Mocked
+            })
+
+        task.result = tool_results
+        logger.info(f"Tool calls for task {task.id} completed. Adding to resumption queue.")
+        await self.resumption_queue.put(task)
+
+    async def _handle_task_completion(self, task: Task):
+        """Handles the completion logic for a task, including dependency resolution."""
+
+
+        if task.status == TaskStatus.COMPLETED:
+            self.completed_tasks_count += 1
+        elif task.status == TaskStatus.FAILED:
+            self.failed_tasks_count += 1
+
+        if task.id in self.task_generators:
+            del self.task_generators[task.id]
+
+        if task.parent_id:
+            parent_task = self.tasks.get(task.parent_id)
+            if parent_task and parent_task.status == TaskStatus.WAITING_FOR_SUBTASKS:
+                all_subtasks_finished = all(
+                    self.tasks.get(sub_id).status in [TaskStatus.COMPLETED, TaskStatus.FAILED]
+                    for sub_id in parent_task.subtasks
                 )
     
-    async def get_stats(self):
-        """获取调度器统计信息"""
-        async with self.lock:
-            return {
-                **self.task_stats,
-                "queued_tasks": sum(len(q) for q in self.queues.values()),
-                "running_tasks": len(self.running_tasks),
-                "strategy": self.strategy
-            }
-    
+                if all_subtasks_finished:
+                    logger.info(f"All subtasks for parent {parent_task.id} are finished.")
+                    if any(self.tasks.get(sub_id).status == TaskStatus.FAILED for sub_id in parent_task.subtasks):
+                        parent_task.fail("One or more subtasks failed.")
+                    else:
+                        parent_task.complete("All subtasks completed successfully.")
+                    await self._handle_task_completion(parent_task)
+
+        for other_task in self.tasks.values():
+            if task.id in other_task.dependencies:
+                other_task.dependencies.remove(task.id)
+
+                if not other_task.dependencies:
+                    logger.info(f"All dependencies for task {other_task.id} are resolved. Enqueuing.")
+                    await self.pending_queue.put(other_task)
+
     async def get_task_by_id(self, task_id: str) -> Optional[Task]:
-        """根据ID获取任务"""
-        # 检查运行中的任务
-        if task_id in self.running_tasks:
-            return self.running_tasks[task_id]
-        
-        # 检查队列中的任务
-        for level in range(self.levels):
-            for task in self.queues[level]:
-                if task.id == task_id:
-                    return task
-        
-        # 检查历史任务
-        for task in self.task_history:
-            if task.id == task_id:
-                return task
-        
-        return None
-    
-    async def set_strategy(self, strategy: SchedulingStrategy):
-        """设置调度策略"""
-        async with self.lock:
-            self.strategy = strategy
-            return {"message": f"调度策略已更新为: {strategy}"}
+        """Retrieves a task by its ID."""
+        return self.tasks.get(task_id)
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """Returns current statistics about the scheduler."""
+        async with self._lock:
+            running_tasks = self.max_concurrent_tasks - self.semaphore._value
+            return {
+                "is_running": self.is_running,
+                "running_tasks": running_tasks,
+                "pending_tasks": self.pending_queue.qsize(),
+                "resumption_queue_size": self.resumption_queue.qsize(),
+                "total_known_tasks": len(self.tasks),
+                "completed_tasks": self.completed_tasks_count,
+                "failed_tasks": self.failed_tasks_count,
+                "max_concurrent_tasks": self.max_concurrent_tasks
+            }

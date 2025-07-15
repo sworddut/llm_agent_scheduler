@@ -1,198 +1,120 @@
 # main.py
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, Query, Path
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
-from enum import Enum
-import asyncio
 import logging
 import os
-import time
-from datetime import datetime
+from fastapi import FastAPI, HTTPException, Path
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List
 
-from src.task import Task, TaskStatus, TaskType
-from src.scheduler import Scheduler, SchedulingStrategy
-from src.agent import Agent
+# Import refactored components
+from src.task import Task, TaskType
+from src.scheduler import Scheduler
+from src.llm_service import LLMService
 
-# 配置日志
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("main")
 
-# 创建应用
+# --- Component Initialization ---
+# Ensure OPENAI_API_KEY is set
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable not set.")
+
+# 1. Create the LLM Service
+llm_service = LLMService(api_key=api_key)
+
+# 2. Create the Scheduler, injecting the LLM service
+scheduler = Scheduler(llm_service=llm_service, max_concurrent_tasks=5)
+
+# --- FastAPI Application Setup ---
 app = FastAPI(
     title="LLM Agent Scheduler",
-    description="一个受操作系统调度启发的 LLM Agent 异步任务调度系统",
-    version="0.2.0"
+    description="An OS-inspired asynchronous scheduler for LLM agents with true concurrency.",
+    version="1.0.0"
 )
 
-# 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境应该限制
+    allow_origins=["*"],  # Be more restrictive in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 创建调度器和代理
-scheduler = Scheduler(levels=3, strategy=SchedulingStrategy.PRIORITY_BASED)
-agent = Agent(scheduler, max_concurrent_tasks=3)
-
-# 模型定义
-from typing import Union, Optional, List, Dict, Any
-
-class TaskInput(BaseModel):
-    name: str = Field(..., description="任务名称")
-    payload: Dict[str, Any] = Field(..., description="任务负载数据")
-    priority: int = Field(1, description="任务优先级 (0: 高, 1: 中, 2: 低)")
-    task_type: Union[TaskType, str] = Field(TaskType.FUNCTION_CALL, description="任务类型")
-    estimated_time: float = Field(1.0, description="预估执行时间（秒）")
-    tags: Optional[List[str]] = Field(None, description="任务标签")
-
-class TaskResponse(BaseModel):
-    task_id: str = Field(..., description="任务ID")
-    status: str = Field(..., description="任务状态")
-    message: str = Field(..., description="状态消息")
-
-class StrategyUpdate(BaseModel):
-    strategy: SchedulingStrategy = Field(..., description="调度策略")
-    time_slice: Optional[float] = Field(None, description="时间片大小（秒）")
-
-# 启动事件
+# --- Application Lifecycle Events ---
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting LLM Agent Scheduler...")
-    asyncio.create_task(agent.start())
+    logger.info("Application startup: Starting scheduler...")
+    await scheduler.start()
 
-# 关闭事件
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Shutting down LLM Agent Scheduler...")
-    await agent.stop()
+    logger.info("Application shutdown: Stopping scheduler...")
+    await scheduler.stop()
 
-# API路由
+# --- Pydantic Models for API ---
+
+class CreateTaskRequest(BaseModel):
+    name: str = Field(..., description="A descriptive name for the task.")
+    payload: Dict[str, Any] = Field(..., description="The data required for the task, e.g., {'messages': [...], 'tools': [...]}")
+    priority: int = 1
+    task_type: str = Field(TaskType.FUNCTION_CALL.value, description="The type of the task.")
+    is_decomposable: bool = False
+
+class TaskResponse(BaseModel):
+    task_id: str
+    message: str = "Task successfully submitted and queued."
+
+# --- API Endpoints ---
 @app.get("/")
 async def root():
     return {
-        "message": "LLM Agent Scheduler 正在运行 ",
-        "version": "0.2.0",
-        "docs_url": "/docs",
-        "stats": await scheduler.get_stats()
+        "message": "LLM Agent Scheduler is running.",
+        "version": app.version,
+        "docs_url": "/docs"
     }
 
-@app.post("/tasks", response_model=TaskResponse, tags=["Tasks"])
-async def submit_task(input: TaskInput):
-    """
-    提交新任务到调度队列
-    
-    - **name**: 任务名称
-    - **payload**: 任务负载数据
-    - **priority**: 任务优先级 (0: 高, 1: 中, 2: 低)
-    - **task_type**: 任务类型 (function_call, api_request, file_operation 或自定义类型)
-    - **estimated_time**: 预估执行时间（秒）
-    - **tags**: 任务标签
-    """
+@app.post("/tasks", response_model=TaskResponse, status_code=202)
+async def submit_task(task_request: CreateTaskRequest):
+    """Submits a new task to the scheduler."""
     try:
-        # 处理 task_type，确保它是字符串
-        task_type = input.task_type.value if isinstance(input.task_type, TaskType) else input.task_type
-        
-        # 创建新任务
-        task = Task(
-            name=input.name,
-            payload=input.payload,
-            priority=input.priority,
-            task_type=task_type,  # 使用处理后的 task_type
-            estimated_time=input.estimated_time,
-            tags=input.tags
-        )
-        
-        # 将任务添加到调度器
-        await scheduler.add_task(task)
-        
-        logger.info(f"任务已提交: {task.id} - {task.name} (类型: {task_type}, 优先级: {task.priority})")
-        
-        return {"task_id": task.id, "status": "queued", "message": "任务已加入队列"}
-        
-    except Exception as e:
-        print(e)
-        logger.error(f"提交任务失败: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        task_type_enum = TaskType(task_request.task_type.lower())
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid task type: '{task_request.task_type}'. Valid types are: {[t.value for t in TaskType]}")
 
-@app.get("/tasks", response_model=List[Dict[str, Any]])
-async def list_tasks(
-    status: Optional[TaskStatus] = Query(None, description="按状态筛选"),
-    priority: Optional[int] = Query(None, description="按优先级筛选"),
-    task_type: Optional[TaskType] = Query(None, description="按任务类型筛选"),
-    limit: int = Query(10, description="返回结果数量限制")
-):
-    """获取任务列表"""
-    # 获取所有任务
-    all_tasks = []
-    
-    # 获取队列中的任务
-    for level in range(scheduler.levels):
-        for task in scheduler.queues[level]:
-            if (status is None or task.status == status) and \
-               (priority is None or task.priority == priority) and \
-               (task_type is None or task.task_type == task_type):
-                all_tasks.append(task.to_dict())
-    
-    # 获取运行中的任务
-    for task_id, task in scheduler.running_tasks.items():
-        if (status is None or task.status == status) and \
-           (priority is None or task.priority == priority) and \
-           (task_type is None or task.task_type == task_type):
-            all_tasks.append(task.to_dict())
-    
-    # 获取历史任务
-    for task in scheduler.task_history:
-        if (status is None or task.status == status) and \
-           (priority is None or task.priority == priority) and \
-           (task_type is None or task.task_type == task_type):
-            all_tasks.append(task.to_dict())
-    
-    # 按创建时间排序并限制数量
-    all_tasks.sort(key=lambda x: x["created_at"], reverse=True)
-    return all_tasks[:limit]
+    try:
+        task = Task(
+            name=task_request.name,
+            payload=task_request.payload,
+            priority=task_request.priority,
+            task_type=task_type_enum,
+            is_decomposable=task_request.is_decomposable
+        )
+        await scheduler.add_task(task)
+        logger.info(f"Task submitted: {task.id} - {task.name}")
+        return {"task_id": task.id}
+    except Exception as e:
+        logger.error(f"Failed to submit task: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/tasks/{task_id}", response_model=Dict[str, Any])
-async def get_task(task_id: str = Path(..., description="任务ID")):
-    """获取特定任务的详情"""
+async def get_task_status(task_id: str = Path(..., description="The ID of the task to retrieve.")):
+    """Retrieves the current status and details of a specific task."""
     task = await scheduler.get_task_by_id(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 未找到")
-    
+        raise HTTPException(status_code=404, detail=f"Task with ID '{task_id}' not found.")
     return task.to_dict()
 
 @app.get("/stats", response_model=Dict[str, Any])
-async def get_stats():
-    """获取调度器统计信息"""
+async def get_scheduler_stats():
+    """Gets current statistics from the scheduler."""
     return await scheduler.get_stats()
 
-@app.put("/scheduler/strategy", response_model=Dict[str, Any])
-async def update_strategy(update: StrategyUpdate):
-    """更新调度策略"""
-    await scheduler.set_strategy(update.strategy)
-    
-    # 如果提供了时间片，更新时间片大小
-    if update.time_slice is not None:
-        scheduler.time_slice = update.time_slice
-    
-    return {
-        "message": f"调度策略已更新为: {update.strategy}",
-        "time_slice": scheduler.time_slice
-    }
-
-# 兼容旧版API
-@app.post("/task")
-async def submit_task_legacy(input: TaskInput):
-    """提交新任务（兼容旧版API）"""
-    return await submit_task(input)
-
-# 启动服务器
+# --- Main Entry Point ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

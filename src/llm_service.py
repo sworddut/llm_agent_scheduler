@@ -20,7 +20,7 @@ logger = logging.getLogger("llm_service")
 class LLMService:
     """LLM 服务类，封装所有与 LLM 交互的功能"""
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "deepseek-ai/DeepSeek-R1"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
         """
         初始化 LLM 服务
         
@@ -34,7 +34,7 @@ class LLMService:
             
         self.model = model
         self.client = AsyncOpenAI(api_key=self.api_key, 
-                base_url="https://api.siliconflow.cn/v1")
+                base_url=os.getenv("OPENAI_BASE_URL"))
     
     async def generate_text(
         self,
@@ -63,6 +63,8 @@ class LLMService:
             messages.append({"role": "system", "content": system_prompt})
             
         messages.append({"role": "user", "content": prompt})
+        print('api_key:',self.api_key)
+        print('base_url:',os.getenv("OPENAI_BASE_URL"))
         
         try:
             response = await self.client.chat.completions.create(
@@ -70,14 +72,18 @@ class LLMService:
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout=60.0,  # Add a 60-second timeout
                 **kwargs
             )
             
             if not response.choices or not response.choices[0].message.content:
                 raise ValueError("No content in response")
-                
+            print('llm output:',response.choices[0].message.content)
             return response.choices[0].message.content
             
+        except asyncio.TimeoutError:
+            logger.error("LLM API call timed out after 60 seconds.")
+            raise
         except Exception as e:
             logger.error(f"Error generating text: {str(e)}")
             raise
@@ -136,6 +142,7 @@ class LLMService:
             )
             
             message = response.choices[0].message
+            print('function_call message:',message)
             tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else []
             
             if tool_calls:

@@ -1,197 +1,130 @@
-# LLM Agent Scheduler v0.2.0
+# Asynchronous LLM Agent Scheduler: A Framework for Autonomous Task Decomposition and Execution
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
-![OpenAI](https://img.shields.io/badge/OpenAI-API-orange)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-🚀 一个受操作系统调度启发的 LLM Agent 异步任务调度系统，支持多级优先队列、Function Call 任务管理和事件驱动处理。适用于构建更高效的多任务 LLM 系统。
+**A next-generation AI agent framework that autonomously decomposes complex tasks into a dependency graph (DAG) and executes them concurrently with a sophisticated asynchronous scheduler.**
 
 ---
 
-## 🌟 项目亮点
+## 1. 🚀 Project Vision & Motivation
 
-- 🧠 **Function Call = Task**：每个 LLM 的 Function Call 被视为一个调度任务
-- 🎯 **多级调度策略**：支持优先级调度、时间片轮转、抢占式和最短作业优先等多种策略
-- ⚡ **并发处理**：支持多任务并行执行，提高系统吞吐量
-- 🔌 **完整 REST API**：基于 FastAPI 构建的全功能 API，支持任务管理和监控
-- 🤖 **OpenAI 集成**：直接集成 OpenAI API 实现真实的 Function Call 处理
-- 📊 **任务统计**：提供详细的任务执行统计和性能指标
-- 🧩 **可扩展架构**：支持自定义任务类型和处理器
+Current mainstream Large Language Model (LLM) Agent frameworks often struggle with complex, multi-step tasks that require intricate dependency management and parallel execution. They typically operate on a linear, reactive loop (e.g., ReAct), which lacks global planning capabilities and leads to inefficiencies and failures when faced with non-linear task flows.
 
----
+This project introduces a novel **Plan-and-Execute** paradigm. We aim to build an intelligent and robust system that can:
 
-## 📁 项目结构
+1.  **Autonomously Decompose**: Take a high-level, ambiguous user goal and have an LLM-powered `PlannerAgent` break it down into a structured, machine-readable task graph (a Directed Acyclic Graph, or DAG).
+2.  **Manage Complex Dependencies**: Explicitly define and manage dependencies between subtasks, ensuring correct execution order (e.g., Task C can only start after both Task A and B are complete).
+3.  **Schedule Concurrently**: Utilize an asynchronous, semaphore-controlled `Scheduler` to execute independent tasks in parallel, maximizing throughput and efficiency.
+4.  **Execute Flexibly**: Employ a generic `Agent` that can dynamically adapt its context and toolset to handle various subtask types, from function calls to further reasoning steps.
 
-```
-llm_agent_scheduler/
-├── .venv/                # 虚拟环境目录
-├── .env                  # 存储 OpenAI API Key 等环境变量
-├── main.py               # 主服务入口
-├── requirements.txt      # 安装依赖列表
-├── src/
-│   ├── agent.py          # Agent 实现，处理任务执行和 OpenAI 集成
-│   ├── scheduler.py      # 调度器实现，支持多种调度策略
-│   └── task.py           # 任务定义，包含任务状态和生命周期管理
-```
+Our system is designed to be **stable, predictable, and efficient**, moving beyond the limitations of conversational or reactive agents to provide a true workflow automation platform.
 
 ---
 
-## ✨ 主要功能
+## 2. 🏛️ System Architecture & Core Components
 
-### 多种调度策略
+The system is built around a central, asynchronous scheduling core, interacting with intelligent agents and a task management system.
 
-- **优先级调度**：基于任务优先级的调度
-- **时间片轮转**：为每个任务分配时间片，支持公平调度
-- **抢占式调度**：高优先级任务可以抢占低优先级任务
-- **最短作业优先**：优先执行预估执行时间最短的任务
+### Key Components (`src/` directory):
 
-### 任务类型
+*   **`task.py`**: Defines the fundamental unit of work, the `Task` object.
+    *   **Attributes**: `id`, `name`, `status` (e.g., `QUEUED`, `RUNNING`, `COMPLETED`, `WAITING_FOR_SUBTASKS`), `dependencies`, `parent_id`.
+    *   **Functionality**: Encapsulates all information required for a task's lifecycle, including its payload, type, and relationships with other tasks.
 
-- **Function Call**：执行 OpenAI Function Call 调用
-- **API 请求**：执行外部 API 调用
-- **文件操作**：处理文件读写操作
-- **自定义任务**：支持扩展自定义任务类型
+*   **`scheduler.py`**: The heart of the system.
+    *   **Core Logic**: Manages a task queue and uses an `asyncio.Semaphore` to control concurrency.
+    *   **`_drive_task` loop**: The main scheduling loop that fetches tasks, checks their dependencies, and dispatches them for execution.
+    *   **Dependency Resolution**: Before running a task, it ensures all its dependencies are in the `COMPLETED` state.
+    *   **Parent Task Management**: When a parent task is decomposed, it enters a `WAITING_FOR_SUBTASKS` state until all its children are finished.
 
-### API 接口
+*   **`agent.py`**: The "brain" and "hands" of the system.
+    *   **`PlannerAgent`**: A specialized agent responsible for the initial planning phase. Its `decompose_task` method uses a carefully crafted system prompt to guide an LLM to return a JSON object representing the task DAG.
+    *   **`Agent`**: The generic task executor. Its `process_task` method is highly flexible:
+        *   **Dynamic Context**: It can start a task from a simple `prompt` or a `tool_name` without requiring a pre-existing `messages` list.
+        *   **Dynamic Tool Schema**: For `FUNCTION_CALL` tasks, it dynamically generates the JSON Schema for the tool based on the provided parameters, ensuring the LLM understands how to call the tool correctly.
 
-- **提交任务**：`POST /tasks`
-- **查询任务列表**：`GET /tasks`
-- **查询任务详情**：`GET /tasks/{task_id}`
-- **获取统计信息**：`GET /stats`
-- **更新调度策略**：`PUT /scheduler/strategy`
-
----
-
-## ✅ 快速开始
-
-### 1. 安装 [uv](https://github.com/astral-sh/uv)
-
-```bash
-# Windows Powershell 安装
-irm https://astral.sh/uv/install.ps1 | iex
-```
-
-安装后请将 uv 所在路径添加到系统环境变量中。
-
-### 2. 创建并激活虚拟环境
-
-```bash
-uv venv
-.venv\Scripts\activate  # Windows
-```
-
-### 3. 安装依赖
-
-```bash
-uv pip install -r requirements.txt
-```
-
-或者安装核心依赖：
-
-```bash
-uv pip install fastapi uvicorn openai python-dotenv
-uv pip freeze > requirements.txt
-```
-
-### 4. 添加环境变量 .env
-
-```ini
-OPENAI_API_KEY=sk-xxx-your-key
-```
-
-### 5. 启动服务
-
-```bash
-uvicorn main:app --reload
-```
-
-服务启动后，访问 http://localhost:8000/docs 查看 API 文档。
+*   **`main.py`**: The FastAPI server that exposes the system's capabilities via a REST API, allowing clients to submit tasks and monitor their progress.
 
 ---
 
-## 📝 使用示例
+## 3. 💡 How We Differ: A Comparative Analysis
 
-### 提交任务
+Our architecture provides unique advantages over existing frameworks:
 
-```bash
-curl -X 'POST' \
-  'http://localhost:8000/tasks' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "name": "天气查询",
-  "payload": {
-    "function_name": "get_weather",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "location": {"type": "string"},
-        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-      },
-      "required": ["location"]
-    },
-    "content": "请查询北京的天气",
-    "model": "gpt-3.5-turbo"
-  },
-  "priority": 0,
-  "task_type": "function_call",
-  "estimated_time": 1.5
-}'
-```
+| Framework | Core Paradigm | Our Key Differentiator |
+| :--- | :--- | :--- |
+| **LangChain Agents** | Reactive Loop (ReAct) | **Proactive Planning**: We generate a global task plan upfront, enabling complex dependency management and parallelism, unlike the linear, step-by-step nature of ReAct. |
+| **AutoGen** | Multi-Agent Conversation | **Structured Execution**: We provide a deterministic, task-driven workflow engine, ensuring predictable and stable execution, in contrast to the emergent and often unpredictable nature of conversational flows. |
+| **CrewAI** | Role-Based Orchestration | **Autonomous Decomposition**: Our `PlannerAgent` autonomously generates the task plan from a high-level goal, whereas CrewAI typically requires developers to pre-define the tasks and workflow. |
 
-### 查询任务列表
-
-```bash
-curl -X 'GET' 'http://localhost:8000/tasks?limit=5'
-```
-
-### 更改调度策略
-
-```bash
-curl -X 'PUT' \
-  'http://localhost:8000/scheduler/strategy' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "strategy": "round_robin",
-  "time_slice": 1.0
-}'
-```
 
 ---
 
-## 🔧 下一步计划
+## 4. 🔬 Academic & Experimental Plan
 
-- 📊 **Web UI 仪表盘**：可视化任务流和调度状态
-- 💾 **持久化存储**：添加数据库支持，持久化任务和状态
-- 🔄 **任务编排**：支持任务依赖和工作流
-- 🔐 **认证与授权**：添加 API 访问控制
-- 📈 **性能基准测试**：评估不同调度策略的性能
-- 🌐 **分布式执行**：支持跨多节点的任务分发
+To validate the effectiveness and superiority of our approach, we are preparing for a submission to a top-tier AI conference (e.g., AAAI, NeurIPS).
 
-## 📚 学术参考
+### Core Thesis
 
-本项目灵感来自：
+An autonomous, DAG-based planning and scheduling system for LLM agents significantly outperforms traditional reactive or conversational models in terms of execution efficiency, stability, and capability to handle complex, non-linear tasks.
 
-- 操作系统任务调度（Multilevel Feedback Queue）
-- LangChain, AutoGen 等 Agent 框架设计
-- ChatGPT Function Call 机制与消息流控制
+### Experimental Setup
 
-## 🧠 你可以做什么？
+We will conduct a comparative study using a representative complex task:
 
-- ✅ 实现 Web UI 可视化任务调度流
-- ✅ 扩展更多任务类型和处理器
-- ✅ 对比不同调度策略对 LLM 响应质量的影响
-- ✅ 添加更多的单元测试和集成测试
+> *"Research the topic 'Applications of Large Language Models in Software Engineering'. First, find the 5 most recent relevant papers on arXiv. Then, summarize each paper. Finally, synthesize all summaries into a brief review report."*
 
-## 📫 贡献
+*   **Frameworks for Comparison**: Our System, CrewAI, AutoGen.
+*   **Metrics**: End-to-end execution time, total LLM API calls (cost), and implementation complexity.
+*   **Location**: All experiment-related code is located in the `/experiments` directory.
 
-欢迎提交 Issue 和 Pull Request 一同探索 LLM Agent 的更优调度方式！
+---
 
-## 📄 许可证
+## 5. 🛠️ Getting Started for Developers
 
-[MIT License](LICENSE)
+1.  **Environment Setup**:
+    ```bash
+    # Create and activate a virtual environment
+    python -m venv .venv
+    source .venv/bin/activate  # On Windows, use `.venv\Scripts\activate`
+
+    # Install dependencies
+    pip install -r requirements.txt
+    ```
+
+2.  **Configuration**:
+    *   Copy `.env.example` to `.env`.
+    *   Fill in your `OPENAI_API_KEY` and, if necessary, the `OPENAI_BASE_URL`.
+
+3.  **Run the Server**:
+    ```bash
+    uvicorn src.main:app --reload
+    ```
+    The API documentation will be available at `http://127.0.0.1:8000/docs`.
+
+4.  **Run the Example Client**:
+    ```bash
+    python example_client.py
+    ```
+
+5.  **Run the Experiments**:
+    Navigate to the `experiments/` directory to find scripts for running comparative tests.
+
+---
+
+## 6. 🗺️ Future Roadmap
+
+- **[Research]** Complete the comparative experiments and publish the findings.
+- **[Feature]** Implement a persistent storage layer (e.g., a database) for tasks to ensure durability.
+- **[Feature]** Develop a more robust error handling and retry mechanism for tasks.
+- **[Feature]** Build a simple web UI to visualize the task graph and monitor execution progress in real-time.
+- **[Feature]** Introduce a memory module for agents to retain context across complex tasks.
+
+## 7. 🤝 Contributing
+
+We welcome contributions! Whether it's improving the core scheduler, adding new agent capabilities, or helping with the experimental analysis, your input is valuable. Please feel free to open an issue or submit a pull request.
 
 
 

@@ -1,10 +1,11 @@
 import arxiv
 import logging
+from typing import Union
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def arxiv_search(query: str, max_results: int = 5) -> str:
+def arxiv_search(query: str, max_results: Union[int, str] = 5) -> str:
     """
     Searches for papers on arXiv based on a query and returns the top results.
 
@@ -17,9 +18,15 @@ def arxiv_search(query: str, max_results: int = 5) -> str:
     """
     try:
         logger.info(f"Executing arxiv_search with query: '{query}' and max_results: {max_results}")
+                # Ensure max_results is an integer
+        try:
+            max_results_int = int(max_results)
+        except (ValueError, TypeError):
+            max_results_int = 5 # Default to 5 if conversion fails
+
         search = arxiv.Search(
             query=query,
-            max_results=max_results,
+            max_results=max_results_int,
             sort_by=arxiv.SortCriterion.Relevance
         )
 
@@ -41,6 +48,30 @@ def arxiv_search(query: str, max_results: int = 5) -> str:
     except Exception as e:
         logger.error(f"An error occurred during arXiv search: {e}")
         return f"Error: Could not perform search. {str(e)}"
+
+# Tool definition for the scheduler and planner
+arxiv_search_tool = {
+    "type": "function",
+    "function": {
+        "name": "arxiv_search",
+        "description": "Searches for papers on arXiv based on a query and returns the top results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query for papers on arXiv."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "The maximum number of papers to return."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "callable": arxiv_search
+}
 
 if __name__ == '__main__':
     # Example usage of the tool

@@ -75,10 +75,16 @@ class Agent:
 
         logger.info(f"Agent starts processing task {task.id} with model {model}. Initial messages: {len(messages)}")
 
+        # Helper function to serialize message objects for logging
+        def message_serializer(obj):
+            if hasattr(obj, 'model_dump'): # Handle Pydantic models from OpenAI's library
+                return obj.model_dump()
+            return str(obj) # Fallback for other types
+
         while True:
             response_message = None
             try:
-                logger.debug(f"Task {task.id}: Sending request to LLM with {len(messages)} messages.")
+                logger.debug(f"Task {task.id}: Sending request to LLM with {len(messages)} messages.\nMessages: {json.dumps(messages, indent=2, default=message_serializer)}")
                 response = await self.llm_service.client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -86,6 +92,7 @@ class Agent:
                     tool_choice="auto" if tools else None,
                 )
                 response_message = response.choices[0].message
+                logger.debug(f"Task {task.id}: Received response from LLM.\nResponse: {response_message}")
 
             except Exception as e:
                 logger.error(f"Task {task.id} failed during LLM API call: {e}", exc_info=True)
@@ -129,34 +136,29 @@ class PlannerAgent:
     def __init__(self, llm_service: LLMService):
         self.llm_service = llm_service
 
-    async def decompose_task(self, task: Task) -> Optional[Dict[str, Any]]:
-        """
-        Decomposes a complex user request into a structured plan of subtasks.
-
-        :param task: The high-level task to decompose.
-        :return: A dictionary representing the execution plan, or None if planning fails.
-        """
+    async def decompose_task(self, task: "Task", tools: list = None) -> dict:
+        logger.info(f"PlannerAgent: Decomposing task {task.id} ('{task.name}')")
         user_prompt = task.payload.get("prompt")
-        if not user_prompt:
-            logger.error(f"PlannerAgent: Task {task.id} is missing 'prompt' in payload.")
-            return None
+        system_prompt = self._get_planning_system_prompt(tools)
 
-        system_prompt = self._get_planning_system_prompt()
-        
+        logger.debug(f"--- Planner System Prompt for Task {task.id} ---\n{system_prompt}\n--------------------------------------------------")
+        logger.debug(f"--- Planner User Prompt for Task {task.id} ---\n{user_prompt}\n--------------------------------------------------")
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
 
         try:
-            logger.info(f"PlannerAgent: Decomposing task {task.id} ('{task.name}')")
             response = await self.llm_service.client.chat.completions.create(
                 model=self.llm_service.model,
                 messages=messages,
                 response_format={"type": "json_object"}, # Force JSON output
             )
             plan_json_str = response.choices[0].message.content
+            logger.debug(f"Planner received LLM response for task {task.id}:\n{plan_json_str}")
             plan = json.loads(plan_json_str)
+            logger.debug(f"Parsed plan for task {task.id}: {plan}")
             logger.info(f"PlannerAgent: Successfully decomposed task {task.id}. Plan has {len(plan.get('subtasks', []))} subtasks.")
             return plan
         except json.JSONDecodeError as e:
@@ -166,77 +168,36 @@ class PlannerAgent:
             logger.error(f"PlannerAgent: LLM call failed during planning for task {task.id}. Error: {e}", exc_info=True)
             return None
 
-    def _get_planning_system_prompt(self) -> str:
-        return """
+    def _get_planning_system_prompt(self, tools: list = None) -> str:
+        base_prompt = """
         You are a master planner AI. Your role is to decompose a complex user request into a series of manageable subtasks.
         You must return the plan as a valid JSON object.
 
         The JSON object should have a single key: "subtasks".
-        The value of "subtasks" should be an array of subtask objects.
+        This key should contain a list of dictionaries, where each dictionary represents a subtask.
 
-        Each subtask object must have the following fields:
-        - "name": A short, descriptive name for the subtask (e.g., "search_for_llm_history").
-        - "task_type": The type of the subtask. Must be one of: ["REASONING", "FUNCTION_CALL"].
-        - "payload": A dictionary containing the necessary data for the subtask. For a REASONING task, this should be a dictionary like `{"prompt": "Detailed question for the subtask..."}`. For a FUNCTION_CALL task, it should contain the arguments.
-        - "dependencies": An array of names of other subtasks that must be completed before this one can start. If there are no dependencies, provide an empty array [].
+        Each subtask dictionary must have the following keys:
+        - "name": A short, descriptive name for the subtask (e.g., "search_for_papers").
+        - "task_type": The type of task. Must be one of: 'planning', 'function_call', 'information_retrieval'.
+        - "payload": A dictionary containing the necessary data for the task.
+            - For 'function_call', it must contain 'tool_name' and 'parameters'.
+            - For other tasks, it can contain a 'prompt'.
+        - "dependencies": A list of names of other subtasks that must be completed before this one can start. Use an empty list if there are no dependencies.
 
-        Analyze the user's request carefully and create a logical, efficient plan. Ensure the dependency graph is correct.
-
-        Here is an example of the expected output format:
-        ```json
-        {
-          "subtasks": [
-            {
-              "name": "find_hotel",
-              "task_type": "REASONING",
-              "payload": {
-                "prompt": "Search for hotels in Tokyo's Shinjuku or Shibuya districts that are highly rated and have good access to public transport."
-              },
-              "dependencies": []
-            },
-            {
-              "name": "create_itinerary",
-              "task_type": "REASONING",
-              "payload": {
-                "prompt": "Create a 7-day itinerary with 2-3 daily activities, ensuring a mix of cultural sites, shopping, and food experiences."
-              },
-              "dependencies": ["find_hotel"]
-            }
-          ]
-        }
-        ```
-
-        Example Request: "Write a blog post about the history of the Eiffel Tower and its current visitor statistics."
-
-        Example JSON Output:
-        {
-            "subtasks": [
-                {
-                    "name": "research_history",
-                    "task_type": "FUNCTION_CALL",
-                    "payload": {
-                        "tool_name": "web_search",
-                        "parameters": {"query": "history of the Eiffel Tower"}
-                    },
-                    "dependencies": []
-                },
-                {
-                    "name": "research_visitor_stats",
-                    "task_type": "FUNCTION_CALL",
-                    "payload": {
-                        "tool_name": "web_search",
-                        "parameters": {"query": "Eiffel Tower visitor statistics 2023"}
-                    },
-                    "dependencies": []
-                },
-                {
-                    "name": "draft_post",
-                    "task_type": "REASONING",
-                    "payload": {
-                        "prompt": "Using the provided context on its history and visitor statistics, write a compelling blog post about the Eiffel Tower."
-                    },
-                    "dependencies": ["research_history", "research_visitor_stats"]
-                }
-            ]
-        }
+        Analyze the user's request carefully and create a logical plan. Ensure that dependencies are correctly identified.
+        For a task that requires summarizing multiple previous results, make it dependent on all those preceding tasks.
+        A final task should always be present to synthesize all results into a final answer.
         """
+
+        tools_prompt_part = ""
+        if tools:
+            tools_description = []
+            for tool in tools:
+                func = tool['function']
+                params = func.get('parameters', {})
+                tools_description.append(
+                    f"- `{func['name']}`: {func.get('description', '')}. Parameters: {params}"
+                )
+            tools_prompt_part = "\n\nHere are the available tools you can use in your plan:\n" + "\n".join(tools_description)
+
+        return base_prompt + tools_prompt_part

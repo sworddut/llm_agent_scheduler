@@ -19,6 +19,7 @@ class TaskType(str, Enum):
     FUNCTION_CALL = "function_call"  # 一个直接的工具或函数调用
     REASONING = "reasoning"          # 需要LLM进行推理
     PLANNING = "planning"            # 一个需要被分解的复杂任务
+    INFORMATION_RETRIEVAL = "information_retrieval" # A task that requires retrieving information
 
 class Task:
     def __init__(self, name: str, payload: dict, priority: int = 1, 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Dict, Any, Optional, AsyncGenerator, List
 
@@ -15,10 +16,12 @@ class Scheduler:
     and enables true concurrent execution.
     """
 
-    def __init__(self, llm_service: LLMService, max_concurrent_tasks: int = 5):
+    def __init__(self, llm_service: LLMService, tools: List[Dict[str, Any]] = None, max_concurrent_tasks: int = 5):
         self.llm_service = llm_service
         self.agent = Agent(llm_service)
         self.planner_agent = PlannerAgent(llm_service)
+        self.tools = tools if tools is not None else []
+        self._tool_functions = {tool['function']['name']: tool['callable'] for tool in self.tools}
         self.max_concurrent_tasks = max_concurrent_tasks
         self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
         
@@ -66,6 +69,19 @@ class Scheduler:
             self.pending_tasks_count += 1
         await self.pending_queue.put(task)
         logger.info(f"Task {task.id} added to the queue.")
+        return task
+
+    def get_task_status(self, task_id: str) -> Optional[str]:
+        """Gets the status of a task."""
+        task = self.tasks.get(task_id)
+        return task.status.value if task else None
+
+    def get_task_result(self, task_id: str) -> Any:
+        """Gets the result of a specific task."""
+        task = self.tasks.get(task_id)
+        if task:
+            return task.result
+        return None
 
     async def _main_loop(self):
         """The core loop that sources tasks from pending and resumption queues."""
@@ -83,9 +99,18 @@ class Scheduler:
                 for future in pending:
                     future.cancel()
 
-                task = done.pop().result()
+                task_or_tuple = done.pop().result()
+                if isinstance(task_or_tuple, tuple):
+                    task, tool_result = task_or_tuple
+                else:
+                    task = task_or_tuple
+                    tool_result = None
+
+                logger.debug(f"Considering task {task.id} for execution. Available semaphore slots: {self.semaphore._value}")
                 await self.semaphore.acquire()
-                asyncio.create_task(self._drive_task(task))
+                logger.debug(f"Semaphore acquired for task {task.id}. Remaining slots: {self.semaphore._value}")
+                self.running_tasks_count += 1
+                asyncio.create_task(self._drive_task(task, tool_result=tool_result))
 
             except asyncio.CancelledError:
                 logger.info("Main loop cancelled.")
@@ -98,15 +123,18 @@ class Scheduler:
         logger.info("Scheduler main loop stopped.")
 
     async def _drive_task(self, task: Task, tool_result: Any = None):
+        logger.info(f"--- Driving task: '{task.name}' ({task.id}), Type: {task.task_type.value}, Status: {task.status.value} ---")
         # This wrapper ensures the semaphore is acquired and released correctly.
+        logger.debug(f"Task '{task.name}' ({task.id}) waiting for semaphore. Available: {self.semaphore._value}")
         await self.semaphore.acquire()
+        logger.debug(f"Task '{task.name}' ({task.id}) acquired semaphore. Available: {self.semaphore._value}")
         try:
 
             # --- Task Decomposition Step ---
             if task.task_type == TaskType.PLANNING and task.status == TaskStatus.QUEUED:
                 try:
 
-                    plan = await self.planner_agent.decompose_task(task)
+                    plan = await self.planner_agent.decompose_task(task, tools=self.tools)
                     subtask_defs = plan.get('subtasks', []) if plan else []
 
                     if not subtask_defs:
@@ -136,13 +164,14 @@ class Scheduler:
                             logger.info(f"Enqueued subtask '{subtask.name}' for parent {task.id}")
 
                     task.status = TaskStatus.WAITING_FOR_SUBTASKS
-                    logger.info(f"Parent task {task.id} is now WAITING_FOR_SUBTASKS.")
+                    logger.info(f"Task '{task.name}' ({task.id}) status is now WAITING_FOR_SUBTASKS.")
 
                 except Exception as e:
                     logger.error(f"Failed to decompose task {task.id}: {e}", exc_info=True)
                     task.fail(f"Decomposition failed: {e}")
                     await self._handle_task_completion(task)
-                return
+                finally:
+                    return
 
             # --- Standard Task Driving Step ---
             if task.id not in self.task_generators:
@@ -155,12 +184,16 @@ class Scheduler:
                     self.task_generators[task.id] = self.agent.process_task(task)
                     send_value = tool_result
             else:
+                logger.info(f"Resuming task {task.id} ({task.name}) which is in status {task.status.value}.")
                 task.status = TaskStatus.RUNNING
                 send_value = tool_result
+                logger.debug(f"Sending tool result back to generator for task {task.id}. Payload snippet: {str(send_value)[:200]}...")
 
             generator = self.task_generators[task.id]
             try:
+                logger.info(f"Awaiting asend() for task {task.id}...")
                 tool_request = await generator.asend(send_value)
+                logger.info(f"asend() completed for task {task.id}.")
                 if tool_request and tool_request.get("type") == "tool_call":
                     task.status = TaskStatus.WAITING_FOR_TOOL
                     logger.info(f"Task {task.id} ({task.name}) is waiting for tool call.")
@@ -180,31 +213,44 @@ class Scheduler:
             task.fail(f"Scheduler-level error: {e}")
             await self._handle_task_completion(task)
         finally:
+            logger.debug(f"Task '{task.name}' ({task.id}) releasing semaphore. Available: {self.semaphore._value + 1}")
             self.semaphore.release()
 
     async def _execute_and_resume_task(self, task: Task, tool_calls: list):
         """Executes tool calls and places the task in the resumption queue."""
-        logger.info(f"Executing {len(tool_calls)} tool calls for task {task.id}...")
-        await asyncio.sleep(2)  # Simulate I/O
-        import json
+        logger.info(f"Executing {len(tool_calls.get('calls', []))} tool calls for task {task.id}...")
         tool_results = []
-        for tool_call in tool_calls.get("tool_calls", []):
-            # In a real scenario, you'd execute the tool and get a real result.
+        for tool_call in tool_calls.get("calls", []):
+            tool_name = tool_call.function.name
+            if tool_name in self._tool_functions:
+                try:
+                    # Arguments are a JSON string, so we need to parse them
+                    args = json.loads(tool_call.function.arguments)
+                    logger.info(f"Calling tool `{tool_name}` with args: {args}")
+                    # In a real-world scenario, you might need to handle async tool functions
+                    result = self._tool_functions[tool_name](**args)
+                    content = json.dumps({"result": result})
+                except Exception as e:
+                    logger.error(f"Error executing tool {tool_name} for task {task.id}: {e}", exc_info=True)
+                    content = json.dumps({"error": str(e)})
+            else:
+                logger.warning(f"Tool `{tool_name}` not found for task {task.id}.")
+                content = json.dumps({"error": f"Tool '{tool_name}' not found."})
+
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
-                "name": tool_call.function.name,
-                "content": json.dumps({"temperature": "30", "unit": "celsius"})  # Mocked
+                "name": tool_name,
+                "content": content,
             })
 
         task.result = tool_results
         logger.info(f"Tool calls for task {task.id} completed. Adding to resumption queue.")
-        await self.resumption_queue.put(task)
+        await self.resumption_queue.put((task, tool_results))
 
     async def _handle_task_completion(self, task: Task):
         """Handles the completion logic for a task, including dependency resolution."""
-
-
+        logger.info(f"--- Task '{task.name}' ({task.id}) finished with status: {task.status.value} ---")
         if task.status == TaskStatus.COMPLETED:
             self.completed_tasks_count += 1
         elif task.status == TaskStatus.FAILED:

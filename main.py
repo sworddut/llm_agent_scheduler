@@ -28,7 +28,7 @@ if not api_key:
 llm_service = LLMService(api_key=api_key)
 
 # 2. Create the Scheduler, injecting the LLM service
-scheduler = Scheduler(llm_service=llm_service, max_concurrent_tasks=5)
+scheduler = Scheduler(llm_service=llm_service, max_concurrent_tasks=20)
 
 # --- FastAPI Application Setup ---
 app = FastAPI(

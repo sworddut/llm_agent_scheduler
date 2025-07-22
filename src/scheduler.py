@@ -291,35 +291,46 @@ class Scheduler:
         async with self._lock:
             if task.status == TaskStatus.COMPLETED:
                 self.completed_tasks_count += 1
+                logger.info(f"--- Task '{task.name}' ({task.id}) COMPLETED ---")
             elif task.status == TaskStatus.FAILED:
                 self.failed_tasks_count += 1
+                logger.error(f"--- Task '{task.name}' ({task.id}) FAILED: {task.result} ---")
 
-            logger.info(f"--- Task '{task.name}' ({task.id}) finished with status: {task.status.name} ---")
-
-            # Clean up generator
+            # Clean up generator for the completed/failed task
             if task.id in self.task_generators:
                 del self.task_generators[task.id]
 
-            # Notify dependent tasks and enqueue them if they become ready.
-            for other_task in self.tasks.values():
-                if task.id in other_task.waiting_for_dependencies:
-                    other_task.waiting_for_dependencies.remove(task.id)
-                    logger.debug(f"Removed dependency '{task.name}' from '{other_task.name}'. Remaining: {len(other_task.waiting_for_dependencies)}")
-                    if other_task.is_ready():
-                        logger.info(f"All dependencies for task '{other_task.name}' are resolved. Enqueuing.")
-                        await self.pending_queue.put(other_task)
+            # --- Dependency Resolution for other tasks ---
+            # Find all tasks that were waiting for this one to finish
+            dependent_tasks = [t for t in self.tasks.values() if task.id in t.waiting_for_dependencies]
+            for dep_task in dependent_tasks:
+                dep_task.waiting_for_dependencies.remove(task.id)
+                logger.info(f"Resolved dependency '{task.name}' for '{dep_task.name}'.")
+                if dep_task.is_ready():
+                    logger.info(f"Task '{dep_task.name}' is now ready. Enqueuing.")
+                    await self.pending_queue.put(dep_task)
 
-            # Notify parent task and check if it's now complete.
+            # --- Parent Task Completion ---
+            # If this was a subtask, check if its parent is now finished
             if task.parent_id and task.parent_id in self.tasks:
                 parent_task = self.tasks[task.parent_id]
                 if task.id in parent_task.waiting_for_subtasks:
                     parent_task.waiting_for_subtasks.remove(task.id)
                 
-                if parent_task.is_complete() and parent_task.status == TaskStatus.WAITING_FOR_SUBTASKS:
-                    logger.info(f"All subtasks for parent '{parent_task.name}' are finished. Completing parent.")
-                    parent_task.complete("All subtasks completed successfully.")
-                    # Recursively handle completion of the parent
+                # If the parent has no more subtasks to wait for, it's complete
+                if not parent_task.waiting_for_subtasks:
+                    logger.info(f"All subtasks for parent '{parent_task.name}' are complete.")
+                    # The result of the parent is the result of its final subtask.
+                    # We assume the last completed subtask holds the final result.
+                    parent_task.complete(result=task.result)
+                    # Recursively handle the completion of the parent task
                     await self._handle_task_completion(parent_task)
+
+                    # Also, if this parent task itself has a parent, remove it from the grandparent's waiting list
+                    if parent_task.parent_id and parent_task.parent_id in self.tasks:
+                        grandparent_task = self.tasks[parent_task.parent_id]
+                        if parent_task.id in grandparent_task.waiting_for_subtasks:
+                            grandparent_task.waiting_for_subtasks.remove(parent_task.id)
 
     async def get_task_by_id(self, task_id: str) -> Optional[Task]:
         """Retrieves a task by its ID."""

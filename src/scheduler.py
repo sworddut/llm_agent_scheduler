@@ -16,12 +16,10 @@ class Scheduler:
     and enables true concurrent execution.
     """
 
-    def __init__(self, llm_service: LLMService, tools: List[Dict[str, Any]] = None, max_concurrent_tasks: int = 5):
+    def __init__(self, llm_service: LLMService, max_concurrent_tasks: int = 5):
         self.llm_service = llm_service
         self.agent = Agent(llm_service)
         self.planner_agent = PlannerAgent(llm_service)
-        self.tools = tools if tools is not None else []
-        self._tool_functions = {tool['function']['name']: tool['callable'] for tool in self.tools}
         self.max_concurrent_tasks = max_concurrent_tasks
         self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
         
@@ -29,6 +27,7 @@ class Scheduler:
         self.resumption_queue = asyncio.Queue()
         
         self.tasks: Dict[str, Task] = {}
+        self.task_name_to_id: Dict[str, str] = {}
         self.task_generators: Dict[str, AsyncGenerator] = {}
         
         self.is_running = False
@@ -41,6 +40,13 @@ class Scheduler:
         self.running_tasks_count = 0
         self.pending_tasks_count = 0
         self.waiting_tasks_count = 0
+
+    @classmethod
+    async def create(cls, llm_service: LLMService, max_concurrent_tasks: int = 5):
+        """Asynchronously creates and initializes a Scheduler instance."""
+        return cls(llm_service, max_concurrent_tasks)
+
+
 
     async def shutdown(self):
         """Shuts down the scheduler gracefully."""
@@ -89,6 +95,7 @@ class Scheduler:
         """Adds a new task to the scheduler's queue."""
         async with self._lock:
             self.tasks[task.id] = task
+            self.task_name_to_id[task.name] = task.id
             self.pending_tasks_count += 1
         await self.pending_queue.put(task)
         logger.info(f"Task {task.id} added to the queue.")
@@ -156,53 +163,42 @@ class Scheduler:
             # --- Task Decomposition Step ---
             if task.task_type == TaskType.PLANNING and task.status == TaskStatus.QUEUED:
                 try:
-
-                    plan = await self.planner_agent.decompose_task(task, tools=self.tools)
-                    subtask_defs = plan.get('subtasks', []) if plan else []
-
-                    if not subtask_defs:
-                        # If planner returns nothing, mark parent as completed.
+                    plan = await self.planner_agent.decompose_task(task)
+                    if plan:
+                        await self._decompose_and_enqueue_subtasks(task, plan)
+                        task.update_status(TaskStatus.WAITING_FOR_SUBTASKS)
+                    else:
+                        task.complete("Planner returned no plan.")
                         await self._handle_task_completion(task)
-                        return
-
-                    all_tasks_by_name = {t.name: t for t in self.tasks.values()}
-                    newly_created_subtasks = {}
-
-                    for sub_def in subtask_defs:
-                        dep_ids = [all_tasks_by_name[dep_name].id for dep_name in sub_def.get('dependencies', []) if dep_name in all_tasks_by_name]
-                        
-                        subtask = Task(
-                            name=sub_def['name'],
-                            payload=sub_def['payload'],
-                            task_type=TaskType(sub_def['task_type'].lower()),
-                            parent_id=task.id,
-                            dependencies=dep_ids
-                        )
-                        self.tasks[subtask.id] = subtask
-                        task.waiting_for_subtasks.add(subtask.id)
-                        newly_created_subtasks[sub_def['name']] = subtask
-
-                    # Enqueue newly created tasks that are ready to run.
-                    for subtask in newly_created_subtasks.values():
-                        if subtask.is_ready():
-                            await self.pending_queue.put(subtask)
-                            logger.info(f"Enqueued new subtask '{subtask.name}' for parent {task.id}")
-
-                    task.update_status(TaskStatus.WAITING_FOR_SUBTASKS)
-                    logger.info(f"Task '{task.name}' ({task.id}) status is now WAITING_FOR_SUBTASKS.")
-
                 except Exception as e:
                     logger.error(f"Failed to decompose task {task.id}: {e}", exc_info=True)
                     task.fail(f"Decomposition failed: {e}")
                     await self._handle_task_completion(task)
                 finally:
-                    # Release semaphore here for planning tasks, so subtasks can run.
-                    logger.debug(f"Planning task '{task.name}' ({task.id}) releasing semaphore early.")
                     self.semaphore.release()
                     return
 
+            # --- Final Summary Task Preparation ---
+            if task.task_type == TaskType.FINAL_SUMMARY and task.status == TaskStatus.QUEUED:
+                summary_prompt = "Synthesize the results from the previous steps to provide a final answer to the user's request.\n\n"
+                summary_prompt += f"Original user request: {task.parent.payload.get('goal', 'N/A')}\n\n"
+                summary_prompt += "Here are the results from the executed tools:\n"
+                
+                for dep_task in task.waiting_for_dependencies:
+                    if dep_task:
+                        summary_prompt += f"- Result from '{dep_task.name}':\n"
+                        summary_prompt += f"  - Status: {dep_task.status.value}\n"
+                        summary_prompt += f"  - Result: {json.dumps(dep_task.result, indent=2)}\n\n"
+                print('=='*20)
+                print(summary_prompt)
+         
+                print('=='*20)
+                task.payload['prompt'] = summary_prompt
+                logger.info(f"Prepared context for FINAL_SUMMARY task '{task.name}'.")
+
             # --- Standard Task Driving Step ---
             else:
+                # For FINAL_SUMMARY, we also create a generator, but after its context has been prepared.
                 if task.id not in self.task_generators:
                     # This is the first time we're driving this task.
                     logger.info(f"Creating new generator for task '{task.name}' ({task.id}).")
@@ -225,7 +221,8 @@ class Scheduler:
                     if tool_request:
                         task.update_status(TaskStatus.WAITING_FOR_TOOL)
                         logger.info(f"Task '{task.name}' ({task.id}) is waiting for tool call.")
-                        await self._execute_and_resume_task(task, tool_request)
+                        # The task will be added to the resumption_queue by _execute_and_resume_task
+                        asyncio.create_task(self._execute_and_resume_task(task, tool_request))
                     else:
                         # Generator finished, task is complete.
                         task.complete(task.result)
@@ -254,33 +251,68 @@ class Scheduler:
             logger.debug(f"Task '{task.name}' ({task.id}) releasing semaphore. Available: {self.semaphore._value + 1}")
             self.semaphore.release()
 
-    async def _execute_and_resume_task(self, task: Task, tool_calls: list):
-        """Executes tool calls and places the task in the resumption queue."""
-        logger.info(f"Executing {len(tool_calls.get('calls', []))} tool calls for task {task.id}...")
-        tool_results = []
-        for tool_call in tool_calls.get("calls", []):
-            tool_name = tool_call.function.name
-            if tool_name in self._tool_functions:
-                try:
-                    # Arguments are a JSON string, so we need to parse them
-                    args = json.loads(tool_call.function.arguments)
-                    logger.info(f"Calling tool `{tool_name}` with args: {args}")
-                    # In a real-world scenario, you might need to handle async tool functions
-                    result = self._tool_functions[tool_name](**args)
-                    content = json.dumps({"result": result})
-                except Exception as e:
-                    logger.error(f"Error executing tool {tool_name} for task {task.id}: {e}", exc_info=True)
-                    content = json.dumps({"error": str(e)})
-            else:
-                logger.warning(f"Tool `{tool_name}` not found for task {task.id}.")
-                content = json.dumps({"error": f"Tool '{tool_name}' not found."})
+    async def _decompose_and_enqueue_subtasks(self, parent_task: Task, plan: Dict[str, Any]):
+        subtask_defs = plan.get('subtasks', [])
+        if not subtask_defs:
+            logger.warning(f"Task {parent_task.id} produced a plan with no subtasks.")
+            return
 
+        # First pass: create all task objects
+        new_tasks_map = {}
+        for subtask_def in subtask_defs:
+            task_type = TaskType[subtask_def.get('task_type', 'SIMPLE').upper()]
+            new_task = Task(
+                name=subtask_def['name'],
+                payload=subtask_def.get('payload', {}),
+                task_type=task_type,
+                dependencies=subtask_def.get('dependencies', [])
+            )
+            new_tasks_map[new_task.name] = new_task
+
+        # Second pass: resolve dependencies and parentage
+        for task_name, task in new_tasks_map.items():
+            task.parent = parent_task
+            parent_task.waiting_for_subtasks.add(task)
+
+            for dep_name in task.dependencies_names:
+                dep_task = new_tasks_map.get(dep_name)
+
+                if dep_task:
+                    task.waiting_for_dependencies.add(dep_task)
+                else:
+                    logger.warning(f"Could not find dependency '{dep_name}' for task '{task.name}' among subtasks.")
+            
+            # Add to scheduler's main task dict and queue
+            await self.add_task(task)
+
+        for subtask in new_tasks_map.values():
+            # Only queue tasks that have no dependencies initially.
+            # Tasks with dependencies will be queued by _handle_task_completion once they are met.
+            if not subtask.waiting_for_dependencies:
+                await self.pending_queue.put(subtask)
+                logger.info(f"Enqueued subtask '{subtask.name}' for parent '{parent_task.name}'.")
+            else:
+                logger.info(f"Subtask '{subtask.name}' has dependencies, deferring queueing.")
+
+    async def _execute_and_resume_task(self, task: Task, tool_request: dict):
+        """Executes tool calls using LLMService and places the task in the resumption queue."""
+        logger.info(f"Executing tool calls for task {task.id} via LLMService...")
+        tool_calls = tool_request.get("calls", [])
+        tool_results = []
+
+        # This can be extended to handle multiple parallel tool calls in the future
+        for tool_call in tool_calls:
+            # Delegate the execution process to the LLMService
+            result_content = await self.llm_service.process_and_call_tool(tool_call)
+
+            # Format the result into the list structure the agent expects
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
-                "name": tool_name,
-                "content": content,
+                "name": tool_call.function.name,
+                "content": result_content,  # The direct output from the service
             })
+
 
         task.result = tool_results
         logger.info(f"Tool calls for task {task.id} completed. Adding to resumption queue.")
@@ -302,35 +334,28 @@ class Scheduler:
 
             # --- Dependency Resolution for other tasks ---
             # Find all tasks that were waiting for this one to finish
-            dependent_tasks = [t for t in self.tasks.values() if task.id in t.waiting_for_dependencies]
+            dependent_tasks = [t for t in self.tasks.values() if task in t.waiting_for_dependencies]
             for dep_task in dependent_tasks:
-                dep_task.waiting_for_dependencies.remove(task.id)
-                logger.info(f"Resolved dependency '{task.name}' for '{dep_task.name}'.")
-                if dep_task.is_ready():
-                    logger.info(f"Task '{dep_task.name}' is now ready. Enqueuing.")
-                    await self.pending_queue.put(dep_task)
+                dep_task.waiting_for_dependencies.remove(task)
+                logger.info(f"Resolved dependency '{task.name}' for '{dep_task.name}'. Remaining: {[d.name for d in dep_task.waiting_for_dependencies]}")
+                if not dep_task.waiting_for_dependencies:
+                    logger.info(f"All dependencies for '{dep_task.name}' are complete. Re-queueing.")
+                    await self._enqueue_task(dep_task)
 
             # --- Parent Task Completion ---
             # If this was a subtask, check if its parent is now finished
-            if task.parent_id and task.parent_id in self.tasks:
-                parent_task = self.tasks[task.parent_id]
-                if task.id in parent_task.waiting_for_subtasks:
-                    parent_task.waiting_for_subtasks.remove(task.id)
+            parent_task = task.parent
+            if parent_task and task in parent_task.waiting_for_subtasks:
+                parent_task.waiting_for_subtasks.remove(task)
                 
-                # If the parent has no more subtasks to wait for, it's complete
                 if not parent_task.waiting_for_subtasks:
-                    logger.info(f"All subtasks for parent '{parent_task.name}' are complete.")
-                    # The result of the parent is the result of its final subtask.
-                    # We assume the last completed subtask holds the final result.
-                    parent_task.complete(result=task.result)
-                    # Recursively handle the completion of the parent task
-                    await self._handle_task_completion(parent_task)
-
-                    # Also, if this parent task itself has a parent, remove it from the grandparent's waiting list
-                    if parent_task.parent_id and parent_task.parent_id in self.tasks:
-                        grandparent_task = self.tasks[parent_task.parent_id]
-                        if parent_task.id in grandparent_task.waiting_for_subtasks:
-                            grandparent_task.waiting_for_subtasks.remove(parent_task.id)
+                    logger.info(f"All subtasks for task '{parent_task.name}' are complete.")
+                    if parent_task.task_type == TaskType.PLANNING:
+                        parent_task.complete(result=task.result)
+                    else:
+                        # If a regular task group finishes, we might need to re-queue the parent
+                        # This case might need more sophisticated handling depending on desired logic
+                        pass
 
     async def get_task_by_id(self, task_id: str) -> Optional[Task]:
         """Retrieves a task by its ID."""

@@ -1,81 +1,68 @@
 import arxiv
 import logging
-from typing import Union
+import asyncio
+import json
+from typing import Union, List, Dict, Any, Callable, Tuple
+from fastmcp import Client
+from functools import partial
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def arxiv_search(query: str, max_results: Union[int, str] = 5) -> str:
+async def get_all_tools() -> Tuple[List[Dict[str, Any]], Dict[str, Callable]]:
     """
-    Searches for papers on arXiv based on a query and returns the top results.
-
-    Args:
-        query (str): The search query.
-        max_results (int): The maximum number of results to return.
-
-    Returns:
-        str: A formatted string containing the search results, including title, authors, and summary for each paper.
+    Gathers all available tools from MCP servers and prepares them for the agent.
     """
+    with open("src/mcp/mcp_config.json", "r") as f:
+        mcp_config = json.load(f)
+    
+    mcp_client = Client(mcp_config)
+
+    all_definitions = []
+    all_callables = {}
+
     try:
-        logger.info(f"Executing arxiv_search with query: '{query}' and max_results: {max_results}")
-                # Ensure max_results is an integer
-        try:
-            max_results_int = int(max_results)
-        except (ValueError, TypeError):
-            max_results_int = 5 # Default to 5 if conversion fails
+        async with mcp_client:
+            # Use the built-in method to get OpenAI-compatible tool definitions
+            mcp_tool_defs = await mcp_client.list_tools()
+            for tool in mcp_tool_defs:
+                # Per user's suggestion, use tool.__dict__ and wrap it for OpenAI format.
+                # We also need to rename 'inputSchema' to 'parameters' for OpenAI compatibility.
+                tool_as_dict = tool.__dict__
+                tool_as_dict['parameters'] = tool_as_dict.pop('inputSchema', {})
 
-        search = arxiv.Search(
-            query=query,
-            max_results=max_results_int,
-            sort_by=arxiv.SortCriterion.Relevance
-        )
+                all_definitions.append({
+                    "type": "function",
+                    "function": tool_as_dict
+                })
 
-        results = []
-        for r in search.results():
-            results.append(
-                f"Title: {r.title}\n"
-                f"Authors: {', '.join(author.name for author in r.authors)}\n"
-                f"Published: {r.published.strftime('%Y-%m-%d')}\n"
-                f"Summary: {r.summary.replace('n', ' ')}\n"
-                f"URL: {r.entry_id}"
-            )
-        
-        if not results:
-            return "No papers found for the given query."
-
-        return "\n---\n".join(results)
-
+                # Create a callable for the tool using its name
+                tool_name = tool.name
+                if tool_name:
+                    all_callables[tool_name] = partial(mcp_client.call_tool, name=tool_name)
+        logger.info(f"Successfully loaded {len(all_definitions)} tools from MCP.")
     except Exception as e:
-        logger.error(f"An error occurred during arXiv search: {e}")
-        return f"Error: Could not perform search. {str(e)}"
+        logger.error(f"Failed to load MCP tools: {e}.")
 
-# Tool definition for the scheduler and planner
-arxiv_search_tool = {
-    "type": "function",
-    "function": {
-        "name": "arxiv_search",
-        "description": "Searches for papers on arXiv based on a query and returns the top results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query for papers on arXiv."
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "The maximum number of papers to return."
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    "callable": arxiv_search
-}
+    logger.info(f"Total tools loaded: {len(all_definitions)}. Names: {list(all_callables.keys())}")
+    return all_definitions, all_callables
 
 if __name__ == '__main__':
-    # Example usage of the tool
-    search_query = "Large Language Models in Software Engineering"
-    papers = arxiv_search(search_query, max_results=2)
-    print("--- Search Results ---")
-    print(papers)
+    async def test_tools():
+        definitions, callables = await get_all_tools()
+        print("--- All Tool Definitions ---")
+        print(json.dumps(definitions, indent=2))
+        
+        print("\n--- Testing a local tool: arxiv_search ---")
+        result = callables['arxiv_search'](query="LLM agents")
+        print(result[:300] + "...")
+
+        print("\n--- Testing an MCP tool: amap-maps-streamableHTTP.maps_weather ---")
+        if 'amap-maps-streamableHTTP.maps_weather' in callables:
+            weather_tool = callables['amap-maps-streamableHTTP.maps_weather']
+            weather_result = await weather_tool(city="广州")
+            print(weather_result)
+        else:
+            print("MCP weather tool not loaded.")
+
+    asyncio.run(test_tools())

@@ -1,8 +1,11 @@
 {
     "mcpServers": {
-      "amap-maps-streamableHTTP": {
-            "url": "https://mcp.amap.com/mcp?key=<amap-token>"
+        "amap-maps-streamableHTTP": {
+            "url": "https://mcp.amap.com/mcp?key=fb73e653fed6bd04314a3811de7dde69"
+        },
+        "local-arxiv-server": {
+            "command": "python",
+            "args": ["src/mcp/mcp_server.py"]
         }
     }
 }
-  

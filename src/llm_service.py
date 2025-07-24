@@ -10,6 +10,12 @@ from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
+import json
+from fastmcp import Client
+
+# read JSON config
+with open("src/mcp/mcp_config.json", "r") as f:
+    config = json.load(f)
 
 # 加载环境变量
 load_dotenv()
@@ -33,8 +39,85 @@ class LLMService:
             raise ValueError("OpenAI API key is required. Please set OPENAI_API_KEY in .env file.")
             
         self.model = model
+        self.mcp_client = Client(config)
         self.client = AsyncOpenAI(api_key=self.api_key, 
                 base_url=os.getenv("OPENAI_BASE_URL"))
+    
+    async def chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        **kwargs
+    ):
+        """
+        Creates a model response for the given chat conversation.
+        This is a wrapper around openai.chat.completions.create.
+        """
+        if model is None:
+            model = self.model
+        
+        # 获取可用工具列表并格式化为OpenAI API兼容的格式
+        async with self.mcp_client:
+            mcp_tools = await self.mcp_client.list_tools()
+        
+        # The 'tools' parameter expects a list of dicts, not a JSON string.
+        # We also need to rename 'inputSchema' to 'parameters' for OpenAI compatibility.
+        tools_for_openai = []
+        for tool in mcp_tools:
+            tool_as_dict = tool.__dict__
+            tool_as_dict['parameters'] = tool_as_dict.pop('inputSchema', {})
+            tools_for_openai.append({
+                "type": "function",
+                "function": tool_as_dict
+            })
+
+        logger.debug(f"Sending chat completion request to model {model} with {len(messages)} messages.")
+        try:
+            api_kwargs = kwargs.copy()
+            if tools_for_openai and "response_format" not in api_kwargs:
+                api_kwargs["tools"] = tools_for_openai
+                api_kwargs["tool_choice"] = "auto"
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **api_kwargs
+            )
+            logger.debug("Received chat completion response.")
+            return response
+        except Exception as e:
+            logger.error(f"An error occurred during chat completion: {e}")
+            raise
+
+    async def process_and_call_tool(self, tool_call) -> str:
+        """
+        Processes a single tool call, executes it, and returns the result as a JSON string.
+        
+        :param tool_call: A tool call object from the OpenAI response.
+        :return: A JSON string representing the result of the tool execution.
+        """
+        try:
+            tool_name = tool_call.function.name
+            tool_args_str = tool_call.function.arguments
+            logger.info(f"Processing tool call: {tool_name} with args: {tool_args_str}")
+
+            # Parse the arguments string into a dictionary
+            tool_args = json.loads(tool_args_str)
+
+            # Call the tool using the MCP client
+            async with self.mcp_client as client:
+                logger.info(f"Executing tool '{tool_name}' via MCP client.")
+                result = await client.call_tool(tool_name, tool_args)
+                logger.info(f"Tool '{tool_name}' executed. Result: {result}")
+                
+                # Ensure the result is a JSON string for the next LLM call
+                if isinstance(result, (dict, list)):
+                    return json.dumps(result)
+                return str(result)
+
+        except (AttributeError, json.JSONDecodeError) as e:
+            error_message = f"Error processing tool call: {e}"
+            logger.error(error_message, exc_info=True)
+            return json.dumps({"error": error_message})
     
     async def generate_text(
         self,

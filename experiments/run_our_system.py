@@ -2,12 +2,12 @@ import asyncio
 import os
 import time
 import logging
+import json
 from dotenv import load_dotenv
 
 from src.scheduler import Scheduler
 from src.task import Task, TaskType, TaskStatus
 from src.llm_service import LLMService
-from experiments.common.tools import arxiv_search_tool
 
 # Configure logging
 logging.basicConfig(
@@ -26,47 +26,44 @@ async def main():
         raise ValueError("OPENAI_API_KEY not found in .env file")
 
     llm_service = LLMService(api_key=api_key)
-    tools = [arxiv_search_tool]
-
-    # 2. Initialize the Scheduler with tools
-    scheduler = Scheduler(llm_service=llm_service, tools=tools, max_concurrent_tasks=20)
+    scheduler = await Scheduler.create(llm_service=llm_service)
 
     # 3. Define the main task
-    initial_prompt = (
-        "Please research and find 3-5 recent (since 2023) and highly cited papers on the applications of "
-        "Large Language Models in Software Engineering. Focus on areas like code generation, testing, and debugging. "
-        "Then, synthesize the findings from these papers into a concise report that summarizes the key trends, challenges, and future directions."
-    )
-    
-    main_task = Task(
-        name="Main Research Task",
+    initial_task = Task(
+        name="Plan Guangzhou Trip",
         task_type=TaskType.PLANNING,
-        payload={"prompt": initial_prompt},
+        payload={
+            "goal": (
+                "Plan a 3-day trip to Guangzhou, China for a tourist interested in unique museums and authentic local food. "
+                "The plan should be detailed, including specific places to visit, suggested times, and restaurant recommendations. "
+                "Use available tools to check the weather to suggest appropriate clothing."
+            )
+        }
     )
 
     # 4. Run the Scheduler and monitor the task
     start_time = time.time()
     await scheduler.start()
-    await scheduler.add_task(main_task)
+    await scheduler.add_task(initial_task)
 
-    logger.info(f"Starting main task {main_task.id}...")
+    logger.info(f"Starting main task {initial_task.id}...")
 
     # Monitor the main task until it's done
     while True:
-        task_status = scheduler.get_task_status(main_task.id)
+        task_status = scheduler.get_task_status(initial_task.id)
         # In our new model, the parent task is 'COMPLETED' only when its subtasks are done.
         # So we can exit the loop once the parent is no longer in a running/waiting state.
-        if main_task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-            logger.info(f"Main task {main_task.id} finished with status: {main_task.status.value}")
+        if initial_task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+            logger.info(f"Main task {initial_task.id} finished with status: {initial_task.status.value}")
             break
-        logger.info(f"Waiting for main task {main_task.id} to complete. Current status: {main_task.status.value}")
+        logger.info(f"Waiting for main task {initial_task.id} to complete. Current status: {initial_task.status.value}")
         await asyncio.sleep(5)
 
     end_time = time.time()
 
     # 5. Report Results
     total_time = end_time - start_time
-    final_result = main_task.result
+    final_result = initial_task.result
 
     print("\n---\n")
     print(f"[Our System] Experiment finished in {total_time:.2f} seconds.")

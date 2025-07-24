@@ -15,22 +15,23 @@ class TaskStatus(Enum):
 
 class TaskType(Enum):
     PLANNING = "planning"
-    FUNCTION_CALL = "function_call"
-    INFORMATION_RETRIEVAL = "information_retrieval"
+    TOOL_CALL = "tool_call"
+    FINAL_SUMMARY = "final_summary"
 
 class Task:
-    def __init__(self, name: str, payload: Dict[str, Any], task_type: TaskType, parent_id: Optional[str] = None, dependencies: Optional[List[str]] = None):
+    def __init__(self, name: str, payload: Dict[str, Any], task_type: TaskType, dependencies: Optional[List[str]] = None):
         self.id = str(uuid.uuid4())
         self.name = name
         self.payload = payload
         self.task_type = task_type
-        self.parent_id = parent_id
+        self.parent: Optional['Task'] = None # Will be set by the scheduler
+        self.dependencies_names = dependencies or [] # Store dependency names temporarily
         
-        # --- Refactored State Management ---
+        # --- Refactored State Management with Direct References ---
         # Dependencies that this task is waiting for.
-        self.waiting_for_dependencies: Set[str] = set(dependencies or [])
+        self.waiting_for_dependencies: Set['Task'] = set()
         # Subtasks that this task has spawned and is waiting for.
-        self.waiting_for_subtasks: Set[str] = set()
+        self.waiting_for_subtasks: Set['Task'] = set()
         
         self.status = TaskStatus.QUEUED
         self.result: Optional[Any] = None

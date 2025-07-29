@@ -117,6 +117,7 @@ class Scheduler:
         """The core loop that sources tasks from pending and resumption queues."""
         logger.info("Scheduler main loop started.")
         while self.is_running:
+            print(f"Waiting for tasks in the queue...pending_queue:{self.pending_queue}\n\n resumption_queue:{self.resumption_queue}")
             pending_task_future = asyncio.create_task(self.pending_queue.get())
             resumption_task_future = asyncio.create_task(self.resumption_queue.get())
 
@@ -179,7 +180,13 @@ class Scheduler:
                     return
 
             # --- Final Summary Task Preparation ---
-            if task.task_type == TaskType.FINAL_SUMMARY and task.status == TaskStatus.QUEUED:
+            elif task.task_type == TaskType.FINAL_SUMMARY and task.status == TaskStatus.QUEUED:
+                # Ensure all dependencies are completed before preparing the summary
+                if not all(dep.status == TaskStatus.COMPLETED for dep in task.waiting_for_dependencies):
+                    logger.info(f"Deferring FINAL_SUMMARY task '{task.name}' as dependencies are not yet complete.")
+                    self.semaphore.release() # Release semaphore so other tasks can run
+                    return # Re-queue or wait, will be picked up again later
+
                 summary_prompt = "Synthesize the results from the previous steps to provide a final answer to the user's request.\n\n"
                 summary_prompt += f"Original user request: {task.parent.payload.get('goal', 'N/A')}\n\n"
                 summary_prompt += "Here are the results from the executed tools:\n"
@@ -197,7 +204,9 @@ class Scheduler:
                 logger.info(f"Prepared context for FINAL_SUMMARY task '{task.name}'.")
 
             # --- Standard Task Driving Step ---
-            else:
+            # This block now handles standard tasks, resumed tasks, and final_summary tasks whose dependencies are met.
+            # It also handles the parent PLANNING task waiting for its subtasks.
+            if task.task_type != TaskType.PLANNING or task.status == TaskStatus.WAITING_FOR_SUBTASKS:
                 # For FINAL_SUMMARY, we also create a generator, but after its context has been prepared.
                 if task.id not in self.task_generators:
                     # This is the first time we're driving this task.
@@ -315,8 +324,10 @@ class Scheduler:
 
 
         task.result = tool_results
+        task.status = TaskStatus.RUNNING  # Set status to indicate it's processing/waiting for tool call result
         logger.info(f"Tool calls for task {task.id} completed. Adding to resumption queue.")
         await self.resumption_queue.put((task, tool_results))
+        logger.info(f"resumption_queue: {self.resumption_queue.qsize()} ")
 
     async def _handle_task_completion(self, task: Task):
         """Handles the logic for when a task finishes, either by completing or failing."""

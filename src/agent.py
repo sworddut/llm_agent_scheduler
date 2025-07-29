@@ -90,7 +90,7 @@ class Agent:
             else:
                 # No tool calls, we have the final answer.
                 final_answer = response_message.content
-                logger.info(f"Task {task.id} finished. Final answer: {final_answer}")
+                logger.info(f"Task {task.id} finished. Final answer: {final_answer[:100]}...")
                 task.complete(final_answer)
                 return
 

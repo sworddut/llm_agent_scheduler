@@ -21,7 +21,7 @@ class Scheduler:
         self.agent = Agent(llm_service)
         self.planner_agent = PlannerAgent(llm_service)
         self.max_concurrent_tasks = max_concurrent_tasks
-        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
         
         self.tasks: Dict[str, Task] = {}
         self.task_name_to_id: Dict[str, str] = {}
@@ -139,9 +139,13 @@ class Scheduler:
 
                     # 1. Execute all tool-related subtasks concurrently and wait for them to complete
                     if tool_subtasks:
-                        logger.info(f"Executing {len(tool_subtasks)} tool subtasks for '{task.name}'.")
-                        subtask_executions = [self.execute_task_recursively(st) for st in tool_subtasks]
-                        await asyncio.gather(*subtask_executions)
+                        logger.info(f"Executing {len(tool_subtasks)} tool subtasks for '{task.name}' with a concurrency limit of {self.max_concurrent_tasks}.")
+
+                        async def run_with_semaphore(subtask: Task):
+                            async with self.semaphore:
+                                await self.execute_task_recursively(subtask)
+
+                        await asyncio.gather(*[run_with_semaphore(st) for st in tool_subtasks])
                     
                     # 2. Once all tool subtasks are done, execute the final summary task
                     if summary_task:
@@ -153,7 +157,15 @@ class Scheduler:
 
             # --- 3. Finalize task completion after all sub-work is done ---
             if task.is_complete():
-                task.complete(task.result) # Result should be set by leaf nodes or aggregated
+                result_to_set = task.result
+                # For a planning task, its final result is the result of its summary subtask.
+                if task.task_type == TaskType.PLANNING:
+                    for subtask in task.subtasks:
+                        if subtask.task_type == TaskType.FINAL_SUMMARY:
+                            result_to_set = subtask.result
+                            break
+                
+                task.complete(result_to_set)
                 logger.info(f"Task '{task.name}' and all its subtasks are complete.")
             else:
                 # This case might indicate an issue if not all subtasks completed
@@ -190,6 +202,7 @@ class Scheduler:
                 logger.warning(f"Deferring FINAL_SUMMARY '{task.name}' as dependencies are not met.")
                 return
             task.payload['prompt'] = self._prepare_summary_prompt(task)
+            print('task.payload["prompt"]', task.payload['prompt'])
 
         # Drive the agent to get a tool request or final answer
         generator = self.agent.process_task(task)
@@ -209,15 +222,9 @@ class Scheduler:
                         # If the agent yields None, it's waiting. Continue driving.
                         next_val = await anext(generator)
             except StopAsyncIteration as e:
-                # The generator has finished.
-                # For FINAL_SUMMARY, the return value is the summary.
-                if task.task_type == TaskType.FINAL_SUMMARY:
-                    summary = getattr(e, 'value', None)
-                    task.result = {"summary": summary}
-                    logger.info(f"Final summary generated for task '{task.name}': {summary}")
-                # For other tasks (TOOL_CALL), the result is set via side effects
-                # within the agent (e.g., storing tool output), so no special
-                # handling is needed here for the return value.
+                # The generator has finished. The agent is responsible for setting
+                # the task's final result via task.complete(). No further action is needed here.
+                pass
 
         except Exception as e:
             logger.error(f"An error occurred while executing task '{task.name}': {e}", exc_info=True)

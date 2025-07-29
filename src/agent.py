@@ -37,7 +37,7 @@ class Agent:
         """
         payload = task.payload
         model = payload.get("model", self.llm_service.model)
-        messages = payload.get("messages", [])
+        messages = payload.get("messages")
 
         # If messages are not provided, construct them from the payload
         if not messages:
@@ -47,7 +47,7 @@ class Agent:
                 # This is a direct command to execute a tool. We can simulate a user request.
                 messages = [{
                     "role": "user", 
-                    "content": f"Please call the tool `{payload['tool_name']}` with the following parameters: {json.dumps(payload.get('parameters', {}))}"
+                    "content": f"Execute the following tool call precisely as specified:\n\nTool: `{payload['tool_name']}`\nParameters: {json.dumps(payload.get('parameters', {}), indent=2)}"
                 }]
             else:
                 logger.error(f"Task {task.id} has an invalid payload: missing 'messages' or 'prompt'. Payload: {payload}")
@@ -90,7 +90,7 @@ class Agent:
             else:
                 # No tool calls, we have the final answer.
                 final_answer = response_message.content
-                logger.info(f"Task {task.id} finished. Final answer: {final_answer[:150]}...")
+                logger.info(f"Task {task.id} finished. Final answer: {final_answer}")
                 task.complete(final_answer)
                 return
 
@@ -187,6 +187,8 @@ Here are the available tools:
 {tools_json_string}
 
 Analyze the user's request and create a logical plan. A final task of type 'final_summary' must be included to provide the final answer to the user, and it should depend on all tool-using tasks.
+
+IMPORTANT: When generating parameters for tool calls, especially for search-related tools, use concise, localized, and native language keywords (e.g., use Chinese for Chinese locations). For example, for a search in Guangzhou, prefer '广州 美食' over 'authentic local food in Guangzhou'. This ensures the best results from the tools.
 
 Example of a valid JSON response:
 {{

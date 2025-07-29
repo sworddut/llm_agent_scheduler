@@ -30,8 +30,8 @@ class Task:
         # --- Refactored State Management with Direct References ---
         # Dependencies that this task is waiting for.
         self.waiting_for_dependencies: Set['Task'] = set()
-        # Subtasks that this task has spawned and is waiting for.
-        self.waiting_for_subtasks: Set['Task'] = set()
+        # Subtasks that this task has spawned.
+        self.subtasks: Set['Task'] = set()
         
         self.status = TaskStatus.QUEUED
         self.result: Optional[Any] = None
@@ -47,7 +47,9 @@ class Task:
 
     def is_complete(self) -> bool:
         """A task is considered fully complete if its subtasks are all done."""
-        return not self.waiting_for_subtasks
+        if not self.subtasks: # A task with no subtasks is complete if it is itself completed.
+            return self.status == TaskStatus.COMPLETED
+        return all(subtask.status == TaskStatus.COMPLETED for subtask in self.subtasks)
 
     def update_status(self, status: TaskStatus):
         self.status = status

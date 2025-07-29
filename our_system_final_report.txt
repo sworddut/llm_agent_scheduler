@@ -1,1 +1,1 @@
-Planner returned no subtasks.
+No result generated.

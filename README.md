@@ -1,135 +1,86 @@
-# Asynchronous LLM Agent Scheduler: A Framework for Autonomous Task Decomposition and Execution
+# Asynchronous LLM Agent Scheduler (v1.0 - Static DAG Executor)
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
+![Framework](https://img.shields.io/badge/Framework-Asyncio-green)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-**A next-generation AI agent framework that autonomously decomposes complex tasks into a dependency graph (DAG) and executes them concurrently with a sophisticated asynchronous scheduler.**
+**A robust framework for autonomously decomposing complex user goals into a static Directed Acyclic Graph (DAG) of tasks and executing them with a high-performance asynchronous scheduler.**
+
+This version (`v1.0`) represents a stable, powerful foundation for building reliable AI agents that can handle intricate, multi-step workflows with explicit dependency management and concurrency.
 
 ---
 
-## 1. 🚀 Project Vision & Motivation
+## 1. 🚀 Core Philosophy: Plan-and-Execute
 
-Current mainstream Large Language Model (LLM) Agent frameworks often struggle with complex, multi-step tasks that require intricate dependency management and parallel execution. They typically operate on a linear, reactive loop (e.g., ReAct), which lacks global planning capabilities and leads to inefficiencies and failures when faced with non-linear task flows.
+This project moves beyond the limitations of simple, reactive agent loops (like ReAct). It implements a **Plan-and-Execute** paradigm, which separates the "thinking" from the "doing":
 
-This project introduces a novel **Plan-and-Execute** paradigm. We aim to build an intelligent and robust system that can:
+1.  **Planning Phase**: A specialized `PlannerAgent` receives a high-level user goal. It leverages a Large Language Model (LLM) to analyze the goal and break it down into a structured, machine-readable plan. This plan is a DAG where nodes are individual subtasks and edges represent dependencies.
 
-1.  **Autonomously Decompose**: Take a high-level, ambiguous user goal and have an LLM-powered `PlannerAgent` break it down into a structured, machine-readable task graph (a Directed Acyclic Graph, or DAG).
-2.  **Manage Complex Dependencies**: Explicitly define and manage dependencies between subtasks, ensuring correct execution order (e.g., Task C can only start after both Task A and B are complete).
-3.  **Schedule Concurrently**: Utilize an asynchronous, semaphore-controlled `Scheduler` to execute independent tasks in parallel, maximizing throughput and efficiency.
-4.  **Execute Flexibly**: Employ a generic `Agent` that can dynamically adapt its context and toolset to handle various subtask types, from function calls to further reasoning steps.
+2.  **Execution Phase**: The `Scheduler` takes this static DAG and executes it. It respects all dependencies and runs independent tasks concurrently, maximizing efficiency and speed.
 
-Our system is designed to be **stable, predictable, and efficient**, moving beyond the limitations of conversational or reactive agents to provide a true workflow automation platform.
+This approach provides unparalleled stability, predictability, and performance for complex workflows.
 
 ---
 
-## 2. 🏛️ System Architecture & Core Components
+## 2. 🏛️ System Architecture
 
-The system is built around a central, asynchronous scheduling core, interacting with intelligent agents and a task management system.
+The system is built on a set of decoupled, high-cohesion components:
 
-### Key Components (`src/` directory):
+*   **`Task` (`src/task.py`)**: The atomic unit of work. Each task has a type (`PLANNING`, `TOOL_CALL`, `FINAL_SUMMARY`), a status, dependencies, and a payload.
 
-*   **`task.py`**: Defines the fundamental unit of work, the `Task` object.
-    *   **Attributes**: `id`, `name`, `status` (e.g., `QUEUED`, `RUNNING`, `COMPLETED`, `WAITING_FOR_SUBTASKS`), `dependencies`, `parent_id`.
-    *   **Functionality**: Encapsulates all information required for a task's lifecycle, including its payload, type, and relationships with other tasks.
+*   **`Scheduler` (`src/scheduler.py`)**: The core of the system. It's an asynchronous engine that:
+    *   Manages a central task store.
+    *   Resolves dependencies, ensuring a task only runs when its prerequisites are complete.
+    *   Uses an `asyncio.Semaphore` to control concurrency and prevent system overload.
+    *   Orchestrates the entire lifecycle of a task from `QUEUED` to `COMPLETED`.
 
-*   **`scheduler.py`**: The heart of the system.
-    *   **Core Logic**: Manages a task queue and uses an `asyncio.Semaphore` to control concurrency.
-    *   **`_drive_task` loop**: The main scheduling loop that fetches tasks, checks their dependencies, and dispatches them for execution.
-    *   **Dependency Resolution**: Before running a task, it ensures all its dependencies are in the `COMPLETED` state.
-    *   **Parent Task Management**: When a parent task is decomposed, it enters a `WAITING_FOR_SUBTASKS` state until all its children are finished.
+*   **`PlannerAgent` (`src/agent.py`)**: The high-level strategic thinker. It takes a user prompt and outputs a JSON object defining the entire task DAG.
 
-*   **`agent.py`**: The "brain" and "hands" of the system.
-    *   **`PlannerAgent`**: A specialized agent responsible for the initial planning phase. Its `decompose_task` method uses a carefully crafted system prompt to guide an LLM to return a JSON object representing the task DAG.
-    *   **`Agent`**: The generic task executor. Its `process_task` method is highly flexible:
-        *   **Dynamic Context**: It can start a task from a simple `prompt` or a `tool_name` without requiring a pre-existing `messages` list.
-        *   **Dynamic Tool Schema**: For `FUNCTION_CALL` tasks, it dynamically generates the JSON Schema for the tool based on the provided parameters, ensuring the LLM understands how to call the tool correctly.
+*   **`Agent` (`src/agent.py`)**: The general-purpose task executor. It handles `TOOL_CALL` and `FINAL_SUMMARY` tasks by interacting with LLMs and external tools (via MCP).
 
-*   **`main.py`**: The FastAPI server that exposes the system's capabilities via a REST API, allowing clients to submit tasks and monitor their progress.
+*   **`MCP Client` (`src/mcp/`)**: A client for the Model-Centric Protocol, allowing agents to interact with external tools (e.g., web search, APIs) in a standardized way.
 
 ---
 
-## 3. 💡 How We Differ: A Comparative Analysis
+## 3. ✨ Key Features of This Version
 
-Our architecture provides unique advantages over existing frameworks:
-
-| Framework | Core Paradigm | Our Key Differentiator |
-| :--- | :--- | :--- |
-| **LangChain Agents** | Reactive Loop (ReAct) | **Proactive Planning**: We generate a global task plan upfront, enabling complex dependency management and parallelism, unlike the linear, step-by-step nature of ReAct. |
-| **AutoGen** | Multi-Agent Conversation | **Structured Execution**: We provide a deterministic, task-driven workflow engine, ensuring predictable and stable execution, in contrast to the emergent and often unpredictable nature of conversational flows. |
-| **CrewAI** | Role-Based Orchestration | **Autonomous Decomposition**: Our `PlannerAgent` autonomously generates the task plan from a high-level goal, whereas CrewAI typically requires developers to pre-define the tasks and workflow. |
-
+- **Autonomous Task Decomposition**: The `PlannerAgent` can autonomously create complex, multi-step plans from a single user request.
+- **DAG-Based Dependency Management**: Full support for defining and executing tasks with intricate dependencies.
+- **Concurrent Execution**: The asynchronous `Scheduler` automatically executes tasks in parallel when their dependencies are met, significantly speeding up execution time.
+- **Centralized State Management**: The `Scheduler` acts as the single source of truth for the status of all tasks, ensuring consistency.
+- **Final Summary Synthesis**: The system can generate a final, coherent report by synthesizing the results from all preceding tool-call subtasks.
 
 ---
 
-## 4. 🔬 Academic & Experimental Plan
+## 4. 🛠️ How to Run
 
-To validate the effectiveness and superiority of our approach, we are preparing for a submission to a top-tier AI conference (e.g., AAAI, NeurIPS).
-
-### Core Thesis
-
-An autonomous, DAG-based planning and scheduling system for LLM agents significantly outperforms traditional reactive or conversational models in terms of execution efficiency, stability, and capability to handle complex, non-linear tasks.
-
-### Experimental Setup
-
-We will conduct a comparative study using a representative complex task:
-
-> *"Research the topic 'Applications of Large Language Models in Software Engineering'. First, find the 5 most recent relevant papers on arXiv. Then, summarize each paper. Finally, synthesize all summaries into a brief review report."*
-
-*   **Frameworks for Comparison**: Our System, CrewAI, AutoGen.
-*   **Metrics**: End-to-end execution time, total LLM API calls (cost), and implementation complexity.
-*   **Location**: All experiment-related code is located in the `/experiments` directory.
-
----
-
-## 5. 🛠️ Getting Started for Developers
-
-1.  **Environment Setup**:
+1.  **Setup Environment**:
     ```bash
     # Create and activate a virtual environment
     python -m venv .venv
-    source .venv/bin/activate  # On Windows, use `.venv\Scripts\activate`
+    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
     # Install dependencies
     pip install -r requirements.txt
     ```
 
-2.  **Configuration**:
+2.  **Configure API Keys**:
     *   Copy `.env.example` to `.env`.
-    *   Fill in your `OPENAI_API_KEY` and, if necessary, the `OPENAI_BASE_URL`.
+    *   Fill in your `OPENAI_API_KEY`.
 
-3.  **Run the Server**:
+3.  **Run the Example**:
+    The primary entry point for testing the system is `experiments/run_our_system.py`.
     ```bash
-    uvicorn src.main:app --reload
+    python -m experiments.run_our_system
     ```
-    The API documentation will be available at `http://127.0.0.1:8000/docs`.
-
-4.  **Run the Example Client**:
-    ```bash
-    python example_client.py
-    ```
-
-5.  **Run the Experiments**:
-    Navigate to the `experiments/` directory to find scripts for running comparative tests.
+    This script will simulate a user request and print the final, synthesized report to the console.
 
 ---
 
-## 6. 🗺️ Future Roadmap
+## 5. 🗺️ Next Steps (Future Branches)
 
-- **[Research]** Complete the comparative experiments and publish the findings.
-- **[Feature]** Implement a persistent storage layer (e.g., a database) for tasks to ensure durability.
-- **[Feature]** Develop a more robust error handling and retry mechanism for tasks.
-- **[Feature]** Build a simple web UI to visualize the task graph and monitor execution progress in real-time.
-- **[Feature]** Introduce a memory module for agents to retain context across complex tasks.
+This stable version paves the way for more advanced capabilities, which will be explored in new branches:
 
-## 7. 🤝 Contributing
-
-We welcome contributions! Whether it's improving the core scheduler, adding new agent capabilities, or helping with the experimental analysis, your input is valuable. Please feel free to open an issue or submit a pull request.
-
-
-
-
-
-
-
-
+- **Dynamic & Reactive Planning**: Evolving the `Scheduler` and `PlannerAgent` to support dynamic, conditional workflows where the task graph can be modified or extended mid-execution based on task results.
+- **Persistent Task Storage**: Integrating a database to store task states, allowing for long-running workflows and recovery.
+- **Enhanced Error Handling**: Implementing robust retry mechanisms and fallback paths for failing tasks.
